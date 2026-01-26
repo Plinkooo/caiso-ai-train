@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CAISO “Best Times to Train” (Green)</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body { font-family: system-ui, Arial; margin: 24px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    label { display: inline-flex; gap: 6px; align-items: center; }
+    input { padding: 6px 8px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    #chart1, #chart2 { width: 100%; max-width: 1100px; height: 420px; }
+    #windows { max-width: 1100px; }
+    .meta { color: #444; margin: 10px 0 18px; }
+    code { background:#f4f4f4; padding:2px 4px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <h1>CAISO next 24 hours: when to train AI (green windows)</h1>
+
+  <div class="row">
+    <label>Top quantile (greener hours):
+      <input id="q" type="number" step="0.05" min="0.50" max="0.95" value="0.80" />
+    </label>
+
+    <label>Min duration:
+      <input id="dur" type="text" value="60min" />
+    </label>
+
+    <button onclick="loadData()">Refresh</button>
+  </div>
+
+  <div class="meta" id="meta"></div>
+
+  <h2>Forecast chart (load, renewables, net load)</h2>
+  <div id="chart1"></div>
+
+  <h2>Green score (shaded = recommended windows)</h2>
+  <div id="chart2"></div>
+
+  <h2>Recommended training windows</h2>
+  <div id="windows"></div>
+
+<script>
+async function loadData() {
+  const q = document.getElementById("q").value;
+  const dur = document.getElementById("dur").value;
+
+  const url = `/api/next24?score_quantile=${encodeURIComponent(q)}&min_duration=${encodeURIComponent(dur)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+
+  const m = data.meta;
+  document.getElementById("meta").textContent =
+    `TZ: ${m.timezone} | Horizon: ${m.horizon_start} → ${m.horizon_end} | Cache TTL: ${m.cache_ttl_seconds}s | Threshold: ${m.threshold_used} >= ${m.threshold_value?.toFixed(3)}`;
+
+  const x = data.series.map(p => p.t_start);
+  const load = data.series.map(p => p.load_forecast_mw);
+  const ren = data.series.map(p => p.renewables_forecast_mw);
+  const net = data.series.map(p => p.net_load_forecast_mw);
+  const score = data.series.map(p => p.green_score);
+
+  // Shaded windows
+  const shapes = data.windows.map(w => ({
+    type: "rect",
+    xref: "x",
+    yref: "paper",
+    x0: w.start,
+    x1: w.end,
+    y0: 0,
+    y1: 1,
+    fillcolor: "rgba(0, 200, 0, 0.14)",
+    line: { width: 0 }
+  }));
+
+  // Chart 1: Load + Renewables + Net Load
+  const tLoad = { x, y: load, type: "scatter", mode: "lines+markers", name: "Load forecast (MW)" };
+  const tRen  = { x, y: ren,  type: "scatter", mode: "lines+markers", name: "Solar+Wind forecast (MW)" };
+  const tNet  = { x, y: net,  type: "scatter", mode: "lines+markers", name: "Net load forecast (MW)" };
+
+  Plotly.newPlot("chart1", [tLoad, tRen, tNet], {
+    title: "Day-ahead forecasts (green proxy uses net load)",
+    xaxis: { title: "Time" },
+    yaxis: { title: "MW" },
+    shapes,
+    margin: { t: 50, r: 20, b: 50, l: 60 }
+  }, {responsive: true});
+
+  // Chart 2: green score
+  const tScore = { x, y: score, type: "scatter", mode: "lines+markers", name: "Green score" };
+
+  Plotly.newPlot("chart2", [tScore], {
+    title: "Green score (higher = greener) + recommended windows shaded",
+    xaxis: { title: "Time" },
+    yaxis: { title: "Score (0–1 approx)" },
+    shapes,
+    margin: { t: 50, r: 20, b: 50, l: 60 }
+  }, {responsive: true});
+
+  // Windows list
+  const winDiv = document.getElementById("windows");
+  if (!data.windows.length) {
+    winDiv.textContent = "No windows found. Try lowering Top quantile (e.g., 0.70) or min duration (e.g., 30min).";
+    return;
+  }
+
+  winDiv.innerHTML =
+    "<ul>" + data.windows.map(w =>
+      `<li><b>${w.start}</b> → <b>${w.end}</b> (${w.duration_minutes} min)
+        | avg net load ${Number.isFinite(w.avg_net_load) ? w.avg_net_load.toFixed(0) : "n/a"}
+        | avg green score ${Number.isFinite(w.avg_green_score) ? w.avg_green_score.toFixed(3) : "n/a"}
+      </li>`
+    ).join("") + "</ul>";
+}
+
+loadData();
+</script>
+</body>
+</html>
