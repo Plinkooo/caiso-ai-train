@@ -54,16 +54,11 @@ def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Tim
     """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals)."""
 
     def _fetch(date, end):
-        if hasattr(caiso, "get_load_forecast_day_ahead"):
-            df = caiso.get_load_forecast_day_ahead(date, end=end)
-        else:
-            # Older gridstatus: use the generic load forecast method
-            df = caiso.get_load_forecast(date, end=end)
-
-        # Keep CA ISO-TAC only when the column exists
-        if "TAC Area Name" in df.columns:
-            df = df[df["TAC Area Name"] == "CA ISO-TAC"].copy()
-        return df
+        if hasattr(caiso, "get_solar_and_wind_forecast_dam"):
+            return caiso.get_solar_and_wind_forecast_dam(date, end=end)
+        if hasattr(caiso, "get_renewables_forecast_dam"):
+            return caiso.get_renewables_forecast_dam(date, end=end)
+        raise RuntimeError("No DAM renewables forecast method found on gridstatus.CAISO()")
 
     df = cached_get("solar_wind_forecast_dam", _fetch, date=start_day, end=end_day)
 
