@@ -1,120 +1,489 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>CAISO “Best Times to Train” (Green)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CAISO AI Training Windows (Next 24h)</title>
+
+  <!-- Plotly for charts (loaded from CDN) -->
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+
   <style>
-    body { font-family: system-ui, Arial; margin: 24px; }
-    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-    label { display: inline-flex; gap: 6px; align-items: center; }
-    input { padding: 6px 8px; }
-    button { padding: 8px 12px; cursor: pointer; }
-    #chart1, #chart2 { width: 100%; max-width: 1100px; height: 420px; }
-    #windows { max-width: 1100px; }
-    .meta { color: #444; margin: 10px 0 18px; }
-    code { background:#f4f4f4; padding:2px 4px; border-radius:4px; }
+    :root {
+      --bg: #0b0f19;
+      --card: #121a2a;
+      --text: #e8eefc;
+      --muted: #a8b3d6;
+      --border: #223055;
+      --accent: #7aa2ff;
+      --warn: #ffcc66;
+      --bad: #ff6b6b;
+      --good: #55efc4;
+    }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(122,162,255,0.12), rgba(0,0,0,0));
+    }
+    header h1 {
+      margin: 0 0 6px 0;
+      font-size: 18px;
+      letter-spacing: .2px;
+    }
+    header p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .wrap {
+      padding: 16px 20px 28px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+    @media (min-width: 980px) {
+      .grid {
+        grid-template-columns: 1.15fr .85fr;
+        align-items: start;
+      }
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 10px 22px rgba(0,0,0,0.22);
+    }
+    .controls {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .controls .full { grid-column: 1 / -1; }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input, select, button {
+      width: 100%;
+      box-sizing: border-box;
+      background: #0f1626;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 10px;
+      border-radius: 10px;
+      font-size: 14px;
+      outline: none;
+    }
+    button {
+      cursor: pointer;
+      background: rgba(122,162,255,0.18);
+      border-color: rgba(122,162,255,0.4);
+      font-weight: 600;
+    }
+    button:hover { background: rgba(122,162,255,0.26); }
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .status b { color: var(--text); }
+    .pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      margin-right: 6px;
+    }
+    .pill.good { border-color: rgba(85,239,196,0.4); color: var(--good); }
+    .pill.warn { border-color: rgba(255,204,102,0.45); color: var(--warn); }
+    .pill.bad  { border-color: rgba(255,107,107,0.45); color: var(--bad); }
+
+    .chart {
+      height: 360px;
+    }
+    .chart.small {
+      height: 320px;
+    }
+    .list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .list li { margin: 7px 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .note {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .errorBox {
+      margin-top: 10px;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,107,107,0.35);
+      background: rgba(255,107,107,0.08);
+      color: var(--text);
+      display: none;
+    }
+    .errorBox pre {
+      white-space: pre-wrap;
+      margin: 0;
+      color: rgba(255,255,255,0.9);
+      font-size: 12px;
+    }
   </style>
 </head>
+
 <body>
-  <h1>CAISO next 24 hours: when to train AI (green windows)</h1>
+  <header>
+    <h1>CAISO AI Training Windows (Next 24h)</h1>
+    <p>Shows forecast-based “next 24h” windows. Prioritizes <span class="mono">Green</span>, <span class="mono">Cheap</span>, and <span class="mono">Both</span> (intersection) when available.</p>
+  </header>
 
-  <div class="row">
-    <label>Top quantile (greener hours):
-      <input id="q" type="number" step="0.05" min="0.50" max="0.95" value="0.80" />
-    </label>
+  <div class="wrap">
+    <div class="grid">
+      <!-- LEFT: charts -->
+      <div class="card">
+        <div id="chart1" class="chart"></div>
+        <div style="height:12px"></div>
+        <div id="chart2" class="chart small"></div>
+        <div style="height:12px"></div>
+        <div id="chart3" class="chart small"></div>
+      </div>
 
-    <label>Min duration:
-      <input id="dur" type="text" value="60min" />
-    </label>
+      <!-- RIGHT: controls + windows -->
+      <div class="card">
+        <div class="controls">
+          <div>
+            <label for="scoreQuantile">Score quantile (higher = pick “best” hours)</label>
+            <input id="scoreQuantile" type="number" step="0.01" min="0.50" max="0.95" value="0.80" />
+          </div>
 
-    <button onclick="loadData()">Refresh</button>
+          <div>
+            <label for="minDuration">Minimum window duration</label>
+            <select id="minDuration">
+              <option value="60min" selected>60min</option>
+              <option value="120min">120min</option>
+              <option value="180min">180min</option>
+            </select>
+          </div>
+
+          <div class="full">
+            <label for="windowMode">Window type to display</label>
+            <select id="windowMode">
+              <option value="auto" selected>Auto (Both → Green fallback)</option>
+              <option value="both">Both (intersection)</option>
+              <option value="green">Green only</option>
+              <option value="cheap">Cheap only</option>
+            </select>
+          </div>
+
+          <div>
+            <label for="greenWeight">Green weight (combined score)</label>
+            <input id="greenWeight" type="number" step="0.05" min="0" max="1" value="0.50" />
+          </div>
+
+          <div>
+            <label for="cheapWeight">Cheap weight (combined score)</label>
+            <input id="cheapWeight" type="number" step="0.05" min="0" max="1" value="0.50" />
+          </div>
+
+          <div class="full">
+            <button id="refreshBtn">Refresh</button>
+          </div>
+        </div>
+
+        <div class="status" id="metaBox"></div>
+
+        <div class="errorBox" id="errorBox">
+          <div style="font-weight:700; margin-bottom:6px;">API error</div>
+          <pre id="errorText"></pre>
+        </div>
+
+        <h3 style="margin:14px 0 8px 0; font-size:14px;">Recommended training windows</h3>
+        <div id="windowPills" style="margin-bottom:8px;"></div>
+        <ol class="list" id="windowList"></ol>
+
+        <div class="note">
+          If <span class="mono">Cheap</span> is empty, your API likely has <span class="mono">lmp_available=false</span>. In that case the page will default to <span class="mono">Green</span> windows automatically.
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div class="meta" id="meta"></div>
-
-  <h2>Forecast chart (load, renewables, net load)</h2>
-  <div id="chart1"></div>
-
-  <h2>Green score (shaded = recommended windows)</h2>
-  <div id="chart2"></div>
-
-  <h2>Recommended training windows</h2>
-  <div id="windows"></div>
-
 <script>
-async function loadData() {
-  const q = document.getElementById("q").value;
-  const dur = document.getElementById("dur").value;
+  const els = {
+    scoreQuantile: document.getElementById("scoreQuantile"),
+    minDuration: document.getElementById("minDuration"),
+    windowMode: document.getElementById("windowMode"),
+    greenWeight: document.getElementById("greenWeight"),
+    cheapWeight: document.getElementById("cheapWeight"),
+    refreshBtn: document.getElementById("refreshBtn"),
+    metaBox: document.getElementById("metaBox"),
+    windowList: document.getElementById("windowList"),
+    windowPills: document.getElementById("windowPills"),
+    errorBox: document.getElementById("errorBox"),
+    errorText: document.getElementById("errorText"),
+  };
 
-  const url = `/api/next24?score_quantile=${encodeURIComponent(q)}&min_duration=${encodeURIComponent(dur)}`;
-  const res = await fetch(url);
-  const data = await res.json();
-
-  const m = data.meta;
-  document.getElementById("meta").textContent =
-    `TZ: ${m.timezone} | Horizon: ${m.horizon_start} → ${m.horizon_end} | Cache TTL: ${m.cache_ttl_seconds}s | Threshold: ${m.threshold_used} >= ${m.threshold_value?.toFixed(3)}`;
-
-  const x = data.series.map(p => p.t_start);
-  const load = data.series.map(p => p.load_forecast_mw);
-  const ren = data.series.map(p => p.renewables_forecast_mw);
-  const net = data.series.map(p => p.net_load_forecast_mw);
-  const score = data.series.map(p => p.green_score);
-
-  // Shaded windows
-  const shapes = data.windows.map(w => ({
-    type: "rect",
-    xref: "x",
-    yref: "paper",
-    x0: w.start,
-    x1: w.end,
-    y0: 0,
-    y1: 1,
-    fillcolor: "rgba(0, 200, 0, 0.14)",
-    line: { width: 0 }
-  }));
-
-  // Chart 1: Load + Renewables + Net Load
-  const tLoad = { x, y: load, type: "scatter", mode: "lines+markers", name: "Load forecast (MW)" };
-  const tRen  = { x, y: ren,  type: "scatter", mode: "lines+markers", name: "Solar+Wind forecast (MW)" };
-  const tNet  = { x, y: net,  type: "scatter", mode: "lines+markers", name: "Net load forecast (MW)" };
-
-  Plotly.newPlot("chart1", [tLoad, tRen, tNet], {
-    title: "Day-ahead forecasts (green proxy uses net load)",
-    xaxis: { title: "Time" },
-    yaxis: { title: "MW" },
-    shapes,
-    margin: { t: 50, r: 20, b: 50, l: 60 }
-  }, {responsive: true});
-
-  // Chart 2: green score
-  const tScore = { x, y: score, type: "scatter", mode: "lines+markers", name: "Green score" };
-
-  Plotly.newPlot("chart2", [tScore], {
-    title: "Green score (higher = greener) + recommended windows shaded",
-    xaxis: { title: "Time" },
-    yaxis: { title: "Score (0–1 approx)" },
-    shapes,
-    margin: { t: 50, r: 20, b: 50, l: 60 }
-  }, {responsive: true});
-
-  // Windows list
-  const winDiv = document.getElementById("windows");
-  if (!data.windows.length) {
-    winDiv.textContent = "No windows found. Try lowering Top quantile (e.g., 0.70) or min duration (e.g., 30min).";
-    return;
+  function fmtDT(iso) {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleString([], { month:"short", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+    } catch {
+      return iso;
+    }
   }
 
-  winDiv.innerHTML =
-    "<ul>" + data.windows.map(w =>
-      `<li><b>${w.start}</b> → <b>${w.end}</b> (${w.duration_minutes} min)
-        | avg net load ${Number.isFinite(w.avg_net_load) ? w.avg_net_load.toFixed(0) : "n/a"}
-        | avg green score ${Number.isFinite(w.avg_green_score) ? w.avg_green_score.toFixed(3) : "n/a"}
-      </li>`
-    ).join("") + "</ul>";
-}
+  function minutesToHuman(mins) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    if (h && m) return `${h}h ${m}m`;
+    if (h) return `${h}h`;
+    return `${m}m`;
+  }
 
-loadData();
+  function showError(msg) {
+    els.errorBox.style.display = "block";
+    els.errorText.textContent = msg;
+  }
+  function hideError() {
+    els.errorBox.style.display = "none";
+    els.errorText.textContent = "";
+  }
+
+  function chooseWindows(data, mode) {
+    const wGreen = data.windows_green || [];
+    const wCheap = data.windows_cheap || [];
+    const wBoth  = data.windows_both || [];
+    const wLegacy = data.windows || [];
+
+    if (mode === "green") return { kind: "green", windows: wGreen };
+    if (mode === "cheap") return { kind: "cheap", windows: wCheap };
+    if (mode === "both")  return { kind: "both",  windows: wBoth.length ? wBoth : wLegacy };
+
+    // auto: prefer both, then green, then cheap, then legacy
+    if (wBoth && wBoth.length) return { kind: "both", windows: wBoth };
+    if (wGreen && wGreen.length) return { kind: "green", windows: wGreen };
+    if (wCheap && wCheap.length) return { kind: "cheap", windows: wCheap };
+    return { kind: "both", windows: wLegacy || [] };
+  }
+
+  function windowPills(meta, chosenKind) {
+    const lmp = meta?.lmp_available ? true : false;
+    const pills = [];
+
+    pills.push(`<span class="pill">TZ: <b>${meta?.timezone || "?"}</b></span>`);
+    pills.push(`<span class="pill">Quantile: <b>${meta?.score_quantile ?? "?"}</b></span>`);
+    pills.push(`<span class="pill">Min dur: <b>${meta?.min_duration || "?"}</b></span>`);
+
+    pills.push(lmp
+      ? `<span class="pill good">LMP available</span>`
+      : `<span class="pill warn">LMP unavailable</span>`
+    );
+
+    pills.push(`<span class="pill">Showing: <b>${chosenKind.toUpperCase()}</b></span>`);
+    return pills.join(" ");
+  }
+
+  function renderWindowList(windows) {
+    els.windowList.innerHTML = "";
+    if (!windows || windows.length === 0) {
+      const li = document.createElement("li");
+      li.textContent = "No windows for the selected mode (try Auto or Green).";
+      els.windowList.appendChild(li);
+      return;
+    }
+    windows.forEach(w => {
+      const li = document.createElement("li");
+      li.innerHTML =
+        `<span class="mono">${fmtDT(w.start)} → ${fmtDT(w.end)}</span>
+         • ${minutesToHuman(w.duration_minutes)}
+         • avg net load: <span class="mono">${(w.avg_net_load ?? 0).toFixed ? w.avg_net_load.toFixed(0) : w.avg_net_load}</span>
+         • avg score: <span class="mono">${(w.avg_score ?? 0).toFixed ? w.avg_score.toFixed(3) : w.avg_score}</span>`;
+      els.windowList.appendChild(li);
+    });
+  }
+
+  function buildShapesFromWindows(windows) {
+    // semi-transparent vertical rectangles across plot area
+    return (windows || []).map(w => ({
+      type: "rect",
+      xref: "x",
+      yref: "paper",
+      x0: w.start,
+      x1: w.end,
+      y0: 0,
+      y1: 1,
+      line: { width: 0 },
+      fillcolor: "rgba(122,162,255,0.15)"
+    }));
+  }
+
+  function renderCharts(data, chosen) {
+    const s = data.series || [];
+    const x = s.map(r => r.t_start);
+
+    const load = s.map(r => r.load_forecast_mw);
+    const ren  = s.map(r => r.renewables_forecast_mw);
+    const net  = s.map(r => r.net_load_forecast_mw);
+
+    const green = s.map(r => r.green_score);
+    const cheap = s.map(r => r.cheap_score);
+    const combo = s.map(r => r.combined_score);
+    const lmp   = s.map(r => r.lmp_usd_per_mwh);
+
+    const shapes = buildShapesFromWindows(chosen.windows);
+
+    // Chart 1: Load + Renewables
+    Plotly.newPlot("chart1", [
+      { x, y: load, name: "Load forecast (MW)", mode: "lines" },
+      { x, y: ren,  name: "Renewables forecast (MW)", mode: "lines" },
+      { x, y: net,  name: "Net load (MW)", mode: "lines" }
+    ], {
+      title: "Next 24h Forecast (Load / Renewables / Net Load)",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
+      font: { color: "#e8eefc" },
+      xaxis: { title: "Time", showgrid: false, zeroline: false },
+      yaxis: { title: "MW", gridcolor: "rgba(34,48,85,0.55)" },
+      margin: { l: 55, r: 18, t: 42, b: 45 },
+      shapes
+    }, { displayModeBar: false });
+
+    // Chart 2: Scores
+    Plotly.newPlot("chart2", [
+      { x, y: green, name: "Green score", mode: "lines" },
+      { x, y: cheap, name: "Cheap score", mode: "lines" },
+      { x, y: combo, name: "Combined score", mode: "lines" }
+    ], {
+      title: "Scores (higher is better)",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
+      font: { color: "#e8eefc" },
+      xaxis: { showgrid: false, zeroline: false },
+      yaxis: { range: [0, 1], gridcolor: "rgba(34,48,85,0.55)" },
+      margin: { l: 55, r: 18, t: 42, b: 45 },
+      shapes
+    }, { displayModeBar: false });
+
+    // Chart 3: LMP if available (otherwise show message line at nulls)
+    Plotly.newPlot("chart3", [
+      { x, y: lmp, name: "LMP ($/MWh)", mode: "lines" }
+    ], {
+      title: "Price (LMP) - if available",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
+      font: { color: "#e8eefc" },
+      xaxis: { showgrid: false, zeroline: false },
+      yaxis: { title: "$/MWh", gridcolor: "rgba(34,48,85,0.55)" },
+      margin: { l: 55, r: 18, t: 42, b: 45 },
+      shapes
+    }, { displayModeBar: false });
+  }
+
+  async function loadData() {
+    hideError();
+
+    const scoreQuantile = parseFloat(els.scoreQuantile.value || "0.8");
+    const minDuration = els.minDuration.value || "60min";
+    const windowMode = els.windowMode.value || "auto";
+
+    const greenWeight = parseFloat(els.greenWeight.value || "0.5");
+    const cheapWeight = parseFloat(els.cheapWeight.value || "0.5");
+
+    const qs = new URLSearchParams({
+      score_quantile: String(scoreQuantile),
+      min_duration: String(minDuration),
+      green_weight: String(greenWeight),
+      cheap_weight: String(cheapWeight),
+    });
+
+    const url = `/api/next24?${qs.toString()}`;
+
+    let res, text, data;
+    try {
+      res = await fetch(url, { cache: "no-store" });
+      text = await res.text();
+    } catch (e) {
+      showError(String(e));
+      return;
+    }
+
+    // If not ok, try to show useful error (even if not JSON)
+    if (!res.ok) {
+      // If backend returns JSON {"detail": "..."}
+      try {
+        const j = JSON.parse(text);
+        showError(j.detail ? String(j.detail) : text);
+      } catch {
+        showError(text || `HTTP ${res.status}`);
+      }
+      return;
+    }
+
+    // Parse JSON
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      showError(`Could not parse JSON. Server returned:\n${text.slice(0, 500)}`);
+      return;
+    }
+
+    const meta = data.meta || {};
+    const chosen = chooseWindows(data, windowMode);
+
+    // Meta/status box
+    const generated = meta.generated_at ? fmtDT(meta.generated_at) : "?";
+    const hStart = meta.horizon_start ? fmtDT(meta.horizon_start) : "?";
+    const hEnd = meta.horizon_end ? fmtDT(meta.horizon_end) : "?";
+
+    els.metaBox.innerHTML = `
+      ${windowPills(meta, chosen.kind)}
+      <div style="margin-top:8px">
+        <div>Generated: <b class="mono">${generated}</b></div>
+        <div>Horizon: <b class="mono">${hStart}</b> → <b class="mono">${hEnd}</b></div>
+        <div>Strategy: <b class="mono">${meta.strategy || "?"}</b></div>
+      </div>
+    `;
+
+    // Windows list
+    els.windowPills.innerHTML = `
+      <span class="pill">Green windows: <b>${(data.windows_green || []).length}</b></span>
+      <span class="pill">Cheap windows: <b>${(data.windows_cheap || []).length}</b></span>
+      <span class="pill">Both windows: <b>${(data.windows_both || []).length}</b></span>
+    `;
+    renderWindowList(chosen.windows);
+
+    // Charts
+    try {
+      renderCharts(data, chosen);
+    } catch (e) {
+      showError(`Chart render error: ${String(e)}`);
+    }
+  }
+
+  els.refreshBtn.addEventListener("click", loadData);
+
+  // Load once on page open
+  loadData();
 </script>
 </body>
 </html>
