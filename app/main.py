@@ -51,17 +51,45 @@ def cached_get(prefix: str, fetch_fn, **kwargs):
 # -----------------------------
 
 def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
-    """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals)."""
+    """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals).
+    Compatible across gridstatus versions.
+    """
 
     def _fetch(date, end):
         if hasattr(caiso, "get_solar_and_wind_forecast_dam"):
             return caiso.get_solar_and_wind_forecast_dam(date, end=end)
         if hasattr(caiso, "get_renewables_forecast_dam"):
             return caiso.get_renewables_forecast_dam(date, end=end)
-        raise RuntimeError("No DAM renewables forecast method found on gridstatus.CAISO()")
+        # Return empty so we can fall back to zeros without 500-ing
+        return pd.DataFrame()
 
     df = cached_get("solar_wind_forecast_dam", _fetch, date=start_day, end=end_day)
+    df = df.copy()
 
+    # If no renewables method is available, return zeros so charts still work
+    if df.empty:
+        hours = pd.date_range(start_day, end_day, freq="H", tz=TZ)
+        out = pd.DataFrame(
+            {
+                "Interval Start": hours[:-1],
+                "Interval End": hours[1:],
+                "Solar MW": 0.0,
+                "Wind MW": 0.0,
+            }
+        )
+        out["Renewables Forecast"] = 0.0
+        return out.sort_values("Interval Start")
+
+    df["Interval Start"] = pd.to_datetime(df["Interval Start"])
+    df["Interval End"] = pd.to_datetime(df["Interval End"])
+
+    # If Location exists, keep CAISO totals
+    if "Location" in df.columns:
+        df = df[df["Location"] == "CAISO"].copy()
+
+    # Some versions expose "Solar MW" and "Wind MW"; some don't
+    if "Solar MW" not in df.columns:
+        df["Solar MW"] = pd.N
 
 def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
     """Hourly day-ahead load forecast (CA ISO-TAC only)."""
