@@ -22,7 +22,6 @@ TZ = pytz.timezone("US/Pacific")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10 min default
 CACHE_MAXSIZE = int(os.getenv("CACHE_MAXSIZE", "256"))
 
-# In-memory TTL cache (fine for single-instance Render services)
 CACHE = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL_SECONDS)
 
 caiso = gridstatus.CAISO()
@@ -76,25 +75,41 @@ def pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optio
 
 
 def find_lmp_column(df: pd.DataFrame) -> Optional[str]:
-    # Try common names first
-    direct = pick_first_existing_column(df, ["LMP", "LMP ($/MWh)", "LMP $/MWh", "LMP_MWH", "lmp"])
+    direct = pick_first_existing_column(df, ["LMP", "LMP ($/MWh)", "LMP $/MWh", "lmp", "price"])
     if direct:
         return direct
-    # Fallback: any column containing "lmp"
     for c in df.columns:
         if "lmp" in c.lower():
             return c
     return None
 
 
+def ensure_hourly_intervals(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure df has Interval Start and Interval End hourly timestamps."""
+    df = df.copy()
+
+    if "Interval Start" in df.columns and "Interval End" in df.columns:
+        df["Interval Start"] = pd.to_datetime(df["Interval Start"])
+        df["Interval End"] = pd.to_datetime(df["Interval End"])
+        return df
+
+    # gridstatus LMP commonly returns a "Time" column for hourly timestamp
+    if "Time" in df.columns:
+        df["Interval Start"] = pd.to_datetime(df["Time"])
+        df["Interval End"] = df["Interval Start"] + pd.Timedelta(hours=1)
+        return df
+
+    # If we can't normalize, return empty with expected columns
+    return pd.DataFrame(columns=["Interval Start", "Interval End"])
+
+
 # -----------------------------
 # Data fetching via gridstatus (CAISO)
 # -----------------------------
 def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
-    """Hourly day-ahead load forecast (best-effort across gridstatus versions)."""
+    """Hourly load forecast (best-effort across gridstatus versions)."""
 
     def _fetch(date, end):
-        # Prefer explicit day-ahead method if present, otherwise generic
         fn = getattr(caiso, "get_load_forecast_day_ahead", None)
         if callable(fn):
             df = fn(date, end=end)
@@ -104,13 +119,13 @@ def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp
                 raise RuntimeError("gridstatus.CAISO() has no load forecast method")
             df = fn2(date, end=end)
 
-        # Some versions include TAC area; keep ISO-TAC if available
         if "TAC Area Name" in df.columns:
             df = df[df["TAC Area Name"] == "CA ISO-TAC"].copy()
 
         return df
 
-    df = cached_get("load_forecast_dam", _fetch, date=start_day, end=end_day).copy()
+    df = cached_get("load_forecast_dam", _fetch, date=start_day, end=end_day)
+    df = df.copy()
 
     if df.empty:
         return pd.DataFrame(columns=["Interval Start", "Interval End", "Load Forecast"])
@@ -118,22 +133,15 @@ def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp
     df["Interval Start"] = pd.to_datetime(df["Interval Start"])
     df["Interval End"] = pd.to_datetime(df["Interval End"])
 
-    # Column name in gridstatus is usually "Load Forecast"
     if "Load Forecast" not in df.columns:
-        # best-effort fallback if column naming differs
         cand = pick_first_existing_column(df, ["Load", "Forecast", "Load (MW)", "MW"])
-        if cand:
-            df["Load Forecast"] = pd.to_numeric(df[cand], errors="coerce")
-        else:
-            df["Load Forecast"] = pd.NA
+        df["Load Forecast"] = pd.to_numeric(df[cand], errors="coerce") if cand else pd.NA
 
     return df[["Interval Start", "Interval End", "Load Forecast"]].sort_values("Interval Start")
 
 
 def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
-    """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals).
-    Compatible across gridstatus versions. Falls back to zeros if DAM renewables isn't available.
-    """
+    """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals)."""
 
     def _fetch(date, end):
         fn = getattr(caiso, "get_solar_and_wind_forecast_dam", None)
@@ -144,13 +152,13 @@ def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Tim
         if callable(fn):
             return fn(date, end=end)
 
-        # No supported method in this installed gridstatus
         return pd.DataFrame()
 
-    df = cached_get("solar_wind_forecast_dam", _fetch, date=start_day, end=end_day).copy()
+    df = cached_get("renewables_dam", _fetch, date=start_day, end=end_day)
+    df = df.copy()
 
-    # If no renewables method exists, return zeros so endpoint still works
     if df.empty:
+        # fallback: zeros so endpoint still works
         hours = pd.date_range(start_day, end_day, freq="H", tz=TZ)
         out = pd.DataFrame(
             {
@@ -158,9 +166,9 @@ def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Tim
                 "Interval End": hours[1:],
                 "Solar MW": 0.0,
                 "Wind MW": 0.0,
+                "Renewables Forecast": 0.0,
             }
         )
-        out["Renewables Forecast"] = 0.0
         return out.sort_values("Interval Start")
 
     df["Interval Start"] = pd.to_datetime(df["Interval Start"])
@@ -186,87 +194,58 @@ def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Tim
 def fetch_day_ahead_lmp(
     start_day: pd.Timestamp,
     end_day: pd.Timestamp,
-    market: str = "DAM",
-    location: Optional[str] = None,
+    locations: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Best-effort day-ahead LMP fetch across gridstatus versions.
-    If not available, returns empty df with Interval Start/End + LMP column.
-    """
+    """Day-ahead hourly LMP (best-effort). Returns Interval Start/End + lmp_usd_per_mwh."""
 
-    def _fetch(date, end, market, location):
-        # Try a few likely method names across gridstatus versions
-        method_names = [
-            "get_lmp_day_ahead",
-            "get_lmp",
-            "get_locational_marginal_prices",
-            "get_lmp_data",
-        ]
+    # Default to common CAISO trading hub AP nodes
+    if locations is None:
+        locations = ["TH_NP15_GEN-APND", "TH_SP15_GEN-APND", "TH_ZP26_GEN-APND"]
 
-        last_err = None
-        for name in method_names:
-            fn = getattr(caiso, name, None)
-            if not callable(fn):
-                continue
-            try:
-                # Try common calling patterns
-                kwargs = {"end": end}
-                # Some methods accept market=...
-                kwargs["market"] = market
+    def _fetch(date, end, locations_key: str):
+        fn = getattr(caiso, "get_lmp", None)
+        if not callable(fn):
+            return pd.DataFrame()
 
-                # Some accept locations=... or location=...
-                if location:
-                    # prefer locations list if supported
-                    try:
-                        return fn(date, locations=[location], **kwargs)  # type: ignore[arg-type]
-                    except TypeError:
-                        try:
-                            return fn(date, location=location, **kwargs)  # type: ignore[arg-type]
-                        except TypeError:
-                            return fn(date, **kwargs)  # type: ignore[arg-type]
-                else:
-                    return fn(date, **kwargs)  # type: ignore[arg-type]
-            except TypeError as e:
-                last_err = e
-                continue
-            except Exception as e:
-                last_err = e
-                continue
+        return fn(
+            date=date,
+            end=end,
+            market="DAY_AHEAD_HOURLY",
+            locations=locations,
+        )
 
-        if last_err:
-            log.warning("LMP fetch unavailable via gridstatus methods: %s", last_err)
-        return pd.DataFrame()
+    df = cached_get(
+        "lmp_dah",
+        _fetch,
+        date=start_day,
+        end=end_day,
+        locations_key=",".join(locations),
+    )
+    if df is None:
+        df = pd.DataFrame()
 
-    df = cached_get("lmp_dam", _fetch, date=start_day, end=end_day, market=market, location=location).copy()
-
+    df = df.copy()
     if df.empty:
-        return pd.DataFrame(columns=["Interval Start", "Interval End", "LMP"])
+        return pd.DataFrame(columns=["Interval Start", "Interval End", "lmp_usd_per_mwh"])
 
-    # Normalize timestamps
-    if "Interval Start" in df.columns:
-        df["Interval Start"] = pd.to_datetime(df["Interval Start"])
-    if "Interval End" in df.columns:
-        df["Interval End"] = pd.to_datetime(df["Interval End"])
+    df = ensure_hourly_intervals(df)
+    if df.empty:
+        return pd.DataFrame(columns=["Interval Start", "Interval End", "lmp_usd_per_mwh"])
 
-    # Ensure LMP column exists
+    # Find LMP column
     lmp_col = find_lmp_column(df)
-    if lmp_col and lmp_col != "LMP":
-        df["LMP"] = pd.to_numeric(df[lmp_col], errors="coerce")
-    elif "LMP" in df.columns:
-        df["LMP"] = pd.to_numeric(df["LMP"], errors="coerce")
-    else:
-        df["LMP"] = pd.NA
+    if not lmp_col:
+        return pd.DataFrame(columns=["Interval Start", "Interval End", "lmp_usd_per_mwh"])
 
-    keep = [c for c in ["Interval Start", "Interval End", "LMP"] if c in df.columns]
-    out = df[keep].copy()
+    df["lmp_usd_per_mwh"] = pd.to_numeric(df[lmp_col], errors="coerce")
 
-    # If the gridstatus method returned multiple nodes, try to filter to a single location if possible
-    if location and "Location" in df.columns:
-        tmp = df[df["Location"] == location].copy()
-        if not tmp.empty:
-            tmp_keep = [c for c in ["Interval Start", "Interval End", "LMP"] if c in tmp.columns]
-            out = tmp[tmp_keep].copy()
-
-    return out.sort_values("Interval Start")
+    # If multiple locations returned, average per hour
+    out = (
+        df.groupby(["Interval Start", "Interval End"], as_index=False)["lmp_usd_per_mwh"]
+        .mean()
+        .sort_values("Interval Start")
+    )
+    return out
 
 
 # -----------------------------
@@ -279,7 +258,6 @@ def contiguous_windows(
     score_col: str = "Green Score",
     netload_col: str = "Net Load Forecast",
 ) -> List[Dict[str, Any]]:
-    """Build contiguous windows from an hourly mask."""
     tmp = df.copy().sort_values("Interval Start").reset_index(drop=True)
     m = mask.fillna(False).reset_index(drop=True)
     if tmp.empty:
@@ -291,11 +269,13 @@ def contiguous_windows(
     for i, is_ok in enumerate(m):
         if is_ok and start_idx is None:
             start_idx = i
+
         if (not is_ok or i == len(m) - 1) and start_idx is not None:
-            end_idx = i if is_ok and i == len(m) - 1 else i - 1
+            end_idx = i if (is_ok and i == len(m) - 1) else i - 1
             start = tmp.loc[start_idx, "Interval Start"]
             end = tmp.loc[end_idx, "Interval End"]
             duration = end - start
+
             if duration >= pd.Timedelta(min_duration):
                 chunk = tmp.loc[start_idx:end_idx]
                 windows.append(
@@ -303,14 +283,15 @@ def contiguous_windows(
                         "start": pd.Timestamp(start).isoformat(),
                         "end": pd.Timestamp(end).isoformat(),
                         "duration_minutes": int(duration.total_seconds() // 60),
-                        "avg_net_load": float(pd.to_numeric(chunk.get(netload_col, pd.Series([])), errors="coerce").mean())
+                        "avg_net_load": float(pd.to_numeric(chunk[netload_col], errors="coerce").mean())
                         if netload_col in chunk.columns
                         else None,
-                        "avg_score": float(pd.to_numeric(chunk.get(score_col, pd.Series([])), errors="coerce").mean())
+                        "avg_score": float(pd.to_numeric(chunk[score_col], errors="coerce").mean())
                         if score_col in chunk.columns
                         else None,
                     }
                 )
+
             start_idx = None
 
     return windows
@@ -324,32 +305,21 @@ def build_next24_dataset(
     min_duration: str = "60min",
     green_weight: float = 0.5,
     cheap_weight: float = 0.5,
-    lmp_location: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Next-24h hourly series with recommended windows:
-    - Green windows (low net load proxy)
-    - Cheap windows (low LMP proxy, best-effort)
-    - Both/Intersection windows (green AND cheap)
-    """
-
     now = pd.Timestamp.now(tz=TZ)
     horizon_start = now.floor("H")
     horizon_end = horizon_start + pd.Timedelta(hours=24)
 
-    # Fetch enough day-ahead data covering today + tomorrow
     start_day = horizon_start.normalize()
     end_day = horizon_end.normalize() + pd.Timedelta(days=1)
 
     load_fc = fetch_day_ahead_load_forecast(start_day, end_day)
     ren_fc = fetch_day_ahead_solar_wind_forecast(start_day, end_day)
-    lmp_df = fetch_day_ahead_lmp(start_day, end_day, market="DAM", location=lmp_location)
+    lmp_df = fetch_day_ahead_lmp(start_day, end_day)
 
-    # Merge
+    # Single, clean merge
     df = load_fc.merge(ren_fc, on=["Interval Start", "Interval End"], how="left")
-    if not lmp_df.empty and all(c in lmp_df.columns for c in ["Interval Start", "Interval End"]):
-        df = df.merge(lmp_df, on=["Interval Start", "Interval End"], how="left")
-    else:
-        df["LMP"] = pd.NA
+    df = df.merge(lmp_df, on=["Interval Start", "Interval End"], how="left")
 
     # Net load proxy
     df["Net Load Forecast"] = pd.to_numeric(df["Load Forecast"], errors="coerce") - pd.to_numeric(
@@ -361,19 +331,15 @@ def build_next24_dataset(
     df = df.sort_values("Interval Start").reset_index(drop=True)
 
     # Scores
-    # Green: lower net load is better
     df["Green Score"] = 1.0 - minmax_normalize(df["Net Load Forecast"])
 
-    # Cheap: lower LMP is better (if available)
-    lmp_available = df["LMP"].notna().any()
+    lmp_available = "lmp_usd_per_mwh" in df.columns and df["lmp_usd_per_mwh"].notna().any()
     if lmp_available:
-        df["Cheap Score"] = 1.0 - minmax_normalize(df["LMP"])
+        df["Cheap Score"] = 1.0 - minmax_normalize(df["lmp_usd_per_mwh"])
     else:
-        # If no LMP, keep it as NA; combined will fall back to Green only
         df["Cheap Score"] = pd.NA
 
-    # Combined: prioritize both cheap+green
-    # If Cheap Score missing, fallback to Green-only
+    # Weights sanity
     gw = float(green_weight)
     cw = float(cheap_weight)
     if gw < 0:
@@ -385,23 +351,14 @@ def build_next24_dataset(
         cw = 0.0
     wsum = gw + cw
 
-    combined = []
-    for _, r in df.iterrows():
-        g = r.get("Green Score")
-        c = r.get("Cheap Score")
-        g_ok = pd.notna(g)
-        c_ok = pd.notna(c)
+    # Combined score
+    if lmp_available:
+        df["Combined Score"] = (gw * df["Green Score"] + cw * df["Cheap Score"]) / wsum
+    else:
+        # If no LMP, combined just behaves like green
+        df["Combined Score"] = df["Green Score"]
 
-        if g_ok and c_ok:
-            combined.append((gw * float(g) + cw * float(c)) / wsum)
-        elif g_ok:
-            combined.append(float(g))
-        else:
-            combined.append(None)
-
-    df["Combined Score"] = combined
-
-    # Thresholds and windows
+    # Thresholds + masks
     green_thr = safe_quantile(df["Green Score"], score_quantile)
     cheap_thr = safe_quantile(df["Cheap Score"], score_quantile) if lmp_available else None
 
@@ -413,22 +370,22 @@ def build_next24_dataset(
     windows_cheap = contiguous_windows(df, cheap_mask, min_duration=min_duration, score_col="Cheap Score")
     windows_both = contiguous_windows(df, both_mask, min_duration=min_duration, score_col="Combined Score")
 
-    # Serialize series for plotting
+    # Serialize series for plotting (this is the part your frontend reads)
     series: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         series.append(
             {
                 "t_start": pd.Timestamp(r["Interval Start"]).isoformat(),
                 "t_end": pd.Timestamp(r["Interval End"]).isoformat(),
-                "load_forecast_mw": float(r["Load Forecast"]) if pd.notna(r["Load Forecast"]) else None,
+                "load_forecast_mw": float(r["Load Forecast"]) if pd.notna(r.get("Load Forecast")) else None,
                 "solar_mw": float(r["Solar MW"]) if pd.notna(r.get("Solar MW")) else None,
                 "wind_mw": float(r["Wind MW"]) if pd.notna(r.get("Wind MW")) else None,
-                "renewables_forecast_mw": float(r["Renewables Forecast"]) if pd.notna(r["Renewables Forecast"]) else None,
-                "net_load_forecast_mw": float(r["Net Load Forecast"]) if pd.notna(r["Net Load Forecast"]) else None,
-                "lmp_usd_per_mwh": float(r["LMP"]) if pd.notna(r.get("LMP")) else None,
-                "green_score": float(r["Green Score"]) if pd.notna(r["Green Score"]) else None,
+                "renewables_forecast_mw": float(r["Renewables Forecast"]) if pd.notna(r.get("Renewables Forecast")) else None,
+                "net_load_forecast_mw": float(r["Net Load Forecast"]) if pd.notna(r.get("Net Load Forecast")) else None,
+                "lmp_usd_per_mwh": float(r["lmp_usd_per_mwh"]) if pd.notna(r.get("lmp_usd_per_mwh")) else None,
+                "green_score": float(r["Green Score"]) if pd.notna(r.get("Green Score")) else None,
                 "cheap_score": float(r["Cheap Score"]) if pd.notna(r.get("Cheap Score")) else None,
-                "combined_score": float(r["Combined Score"]) if r.get("Combined Score") is not None else None,
+                "combined_score": float(r["Combined Score"]) if pd.notna(r.get("Combined Score")) else None,
             }
         )
 
@@ -444,16 +401,14 @@ def build_next24_dataset(
             "min_duration": min_duration,
             "weights": {"green": gw, "cheap": cw},
             "lmp_available": bool(lmp_available),
-            "lmp_location": lmp_location,
             "thresholds": {"green": green_thr, "cheap": cheap_thr},
             "window_types": ["green", "cheap", "both_intersection"],
         },
         "series": series,
-        # New fields (what you asked for)
         "windows_green": windows_green,
         "windows_cheap": windows_cheap,
         "windows_both": windows_both,
-        # Backward-compatible alias: "windows" = intersection (agree) windows
+        # Backward-compatible alias: "windows" = intersection
         "windows": windows_both,
     }
 
@@ -472,31 +427,21 @@ def api_next24(
     min_duration: str = Query("60min"),
     green_weight: float = Query(0.5, ge=0.0, le=1.0),
     cheap_weight: float = Query(0.5, ge=0.0, le=1.0),
-    lmp_location: Optional[str] = Query(None),
 ):
-    """Returns next-24h hourly series + windows:
-    - windows_green
-    - windows_cheap
-    - windows_both (intersection)
-    Also includes legacy "windows" == windows_both.
-    """
     try:
         return build_next24_dataset(
             score_quantile=score_quantile,
             min_duration=min_duration,
             green_weight=green_weight,
             cheap_weight=cheap_weight,
-            lmp_location=lmp_location,
         )
     except Exception as e:
         log.exception("api_next24 crashed")
-        # Return JSON error so frontend doesn't choke on non-JSON
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/debug_methods")
 def debug_methods():
-    """Helps diagnose which gridstatus methods exist in production."""
     return {
         "file": __file__,
         "python": os.getenv("PYTHON_VERSION", "unknown"),
@@ -504,9 +449,5 @@ def debug_methods():
         "has_load_forecast": callable(getattr(caiso, "get_load_forecast", None)),
         "has_solar_wind_dam": callable(getattr(caiso, "get_solar_and_wind_forecast_dam", None)),
         "has_renewables_dam": callable(getattr(caiso, "get_renewables_forecast_dam", None)),
-        "lmp_methods_present": [
-            name
-            for name in ["get_lmp_day_ahead", "get_lmp", "get_locational_marginal_prices", "get_lmp_data"]
-            if callable(getattr(caiso, name, None))
-        ],
+        "lmp_methods_present": [name for name in ["get_lmp"] if callable(getattr(caiso, name, None))],
     }
