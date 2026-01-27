@@ -186,7 +186,6 @@ def fetch_day_ahead_lmp(
     end_day: pd.Timestamp,
     locations: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    # Default CAISO trading hub AP nodes
     if locations is None:
         locations = ["TH_NP15_GEN-APND", "TH_SP15_GEN-APND", "TH_ZP26_GEN-APND"]
 
@@ -244,12 +243,6 @@ def contiguous_windows(
     score_col: str = "Green Score",
     netload_col: str = "Net Load Forecast",
 ) -> List[Dict[str, Any]]:
-    """
-    Build contiguous windows from an hourly mask.
-
-    Default: no max_duration -> returns the full contiguous blocks (best for training).
-    If max_duration is set: splits long blocks into chunks no longer than max_duration.
-    """
     tmp = df.copy().sort_values("Interval Start").reset_index(drop=True)
     m = mask.fillna(False).reset_index(drop=True)
     if tmp.empty:
@@ -294,7 +287,6 @@ def contiguous_windows(
                 start_idx = None
                 continue
 
-            # split into chunks <= max_td
             chunk_start = start_idx
             while chunk_start <= end_idx:
                 chunk_end = chunk_start
@@ -316,16 +308,20 @@ def contiguous_windows(
 # -----------------------------
 # Dataset build: green + cheap + intersection
 # -----------------------------
-def build_next24_dataset(
+def build_forecast_dataset(
+    hours: int = 24,
     score_quantile: float = 0.80,
     min_duration: str = "60min",
     max_duration: Optional[str] = None,
     green_weight: float = 0.5,
     cheap_weight: float = 0.5,
 ) -> Dict[str, Any]:
+    if hours not in (24, 48, 72):
+        raise ValueError("hours must be 24, 48, or 72")
+
     now = pd.Timestamp.now(tz=TZ)
     horizon_start = now.floor("H")
-    horizon_end = horizon_start + pd.Timedelta(hours=24)
+    horizon_end = horizon_start + pd.Timedelta(hours=hours)
 
     start_day = horizon_start.normalize()
     end_day = horizon_end.normalize() + pd.Timedelta(days=1)
@@ -403,6 +399,7 @@ def build_next24_dataset(
         "meta": {
             "timezone": "US/Pacific",
             "generated_at": now.isoformat(),
+            "horizon_hours": hours,
             "horizon_start": horizon_start.isoformat(),
             "horizon_end": horizon_end.isoformat(),
             "cache_ttl_seconds": CACHE_TTL_SECONDS,
@@ -418,7 +415,7 @@ def build_next24_dataset(
         "windows_green": windows_green,
         "windows_cheap": windows_cheap,
         "windows_both": windows_both,
-        "windows": windows_both,  # backward-compatible: intersection windows
+        "windows": windows_both,
     }
 
 
@@ -432,14 +429,20 @@ def home():
 
 @app.get("/api/next24")
 def api_next24(
+    hours: int = Query(24, ge=24, le=72),
     score_quantile: float = Query(0.80, ge=0.50, le=0.95),
     min_duration: str = Query("60min"),
     max_duration: Optional[str] = Query(None),
     green_weight: float = Query(0.5, ge=0.0, le=1.0),
     cheap_weight: float = Query(0.5, ge=0.0, le=1.0),
 ):
+    # constrain to 24/48/72 only
+    if hours not in (24, 48, 72):
+        raise HTTPException(status_code=400, detail="hours must be 24, 48, or 72")
+
     try:
-        return build_next24_dataset(
+        return build_forecast_dataset(
+            hours=hours,
             score_quantile=score_quantile,
             min_duration=min_duration,
             max_duration=max_duration,
