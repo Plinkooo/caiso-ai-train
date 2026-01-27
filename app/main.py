@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 # Config
 # -----------------------------
 TZ = pytz.timezone("US/Pacific")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10 min default
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 CACHE_MAXSIZE = int(os.getenv("CACHE_MAXSIZE", "256"))
 
 CACHE = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL_SECONDS)
@@ -85,7 +85,6 @@ def find_lmp_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def ensure_hourly_intervals(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure df has Interval Start and Interval End hourly timestamps."""
     df = df.copy()
 
     if "Interval Start" in df.columns and "Interval End" in df.columns:
@@ -93,13 +92,11 @@ def ensure_hourly_intervals(df: pd.DataFrame) -> pd.DataFrame:
         df["Interval End"] = pd.to_datetime(df["Interval End"])
         return df
 
-    # gridstatus LMP commonly returns a "Time" column for hourly timestamp
     if "Time" in df.columns:
         df["Interval Start"] = pd.to_datetime(df["Time"])
         df["Interval End"] = df["Interval Start"] + pd.Timedelta(hours=1)
         return df
 
-    # If we can't normalize, return empty with expected columns
     return pd.DataFrame(columns=["Interval Start", "Interval End"])
 
 
@@ -107,8 +104,6 @@ def ensure_hourly_intervals(df: pd.DataFrame) -> pd.DataFrame:
 # Data fetching via gridstatus (CAISO)
 # -----------------------------
 def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
-    """Hourly load forecast (best-effort across gridstatus versions)."""
-
     def _fetch(date, end):
         fn = getattr(caiso, "get_load_forecast_day_ahead", None)
         if callable(fn):
@@ -124,8 +119,7 @@ def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp
 
         return df
 
-    df = cached_get("load_forecast_dam", _fetch, date=start_day, end=end_day)
-    df = df.copy()
+    df = cached_get("load_forecast_dam", _fetch, date=start_day, end=end_day).copy()
 
     if df.empty:
         return pd.DataFrame(columns=["Interval Start", "Interval End", "Load Forecast"])
@@ -141,8 +135,6 @@ def fetch_day_ahead_load_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp
 
 
 def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
-    """Hourly day-ahead solar+wind forecast (Location == 'CAISO' totals)."""
-
     def _fetch(date, end):
         fn = getattr(caiso, "get_solar_and_wind_forecast_dam", None)
         if callable(fn):
@@ -154,11 +146,9 @@ def fetch_day_ahead_solar_wind_forecast(start_day: pd.Timestamp, end_day: pd.Tim
 
         return pd.DataFrame()
 
-    df = cached_get("renewables_dam", _fetch, date=start_day, end=end_day)
-    df = df.copy()
+    df = cached_get("renewables_dam", _fetch, date=start_day, end=end_day).copy()
 
     if df.empty:
-        # fallback: zeros so endpoint still works
         hours = pd.date_range(start_day, end_day, freq="H", tz=TZ)
         out = pd.DataFrame(
             {
@@ -196,9 +186,7 @@ def fetch_day_ahead_lmp(
     end_day: pd.Timestamp,
     locations: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Day-ahead hourly LMP (best-effort). Returns Interval Start/End + lmp_usd_per_mwh."""
-
-    # Default to common CAISO trading hub AP nodes
+    # Default CAISO trading hub AP nodes
     if locations is None:
         locations = ["TH_NP15_GEN-APND", "TH_SP15_GEN-APND", "TH_ZP26_GEN-APND"]
 
@@ -206,7 +194,6 @@ def fetch_day_ahead_lmp(
         fn = getattr(caiso, "get_lmp", None)
         if not callable(fn):
             return pd.DataFrame()
-
         return fn(
             date=date,
             end=end,
@@ -232,14 +219,12 @@ def fetch_day_ahead_lmp(
     if df.empty:
         return pd.DataFrame(columns=["Interval Start", "Interval End", "lmp_usd_per_mwh"])
 
-    # Find LMP column
     lmp_col = find_lmp_column(df)
     if not lmp_col:
         return pd.DataFrame(columns=["Interval Start", "Interval End", "lmp_usd_per_mwh"])
 
     df["lmp_usd_per_mwh"] = pd.to_numeric(df[lmp_col], errors="coerce")
 
-    # If multiple locations returned, average per hour
     out = (
         df.groupby(["Interval Start", "Interval End"], as_index=False)["lmp_usd_per_mwh"]
         .mean()
@@ -255,16 +240,47 @@ def contiguous_windows(
     df: pd.DataFrame,
     mask: pd.Series,
     min_duration: str = "60min",
+    max_duration: Optional[str] = None,
     score_col: str = "Green Score",
     netload_col: str = "Net Load Forecast",
 ) -> List[Dict[str, Any]]:
+    """
+    Build contiguous windows from an hourly mask.
+
+    Default: no max_duration -> returns the full contiguous blocks (best for training).
+    If max_duration is set: splits long blocks into chunks no longer than max_duration.
+    """
     tmp = df.copy().sort_values("Interval Start").reset_index(drop=True)
     m = mask.fillna(False).reset_index(drop=True)
     if tmp.empty:
         return []
 
+    min_td = pd.Timedelta(min_duration)
+    max_td = pd.Timedelta(max_duration) if max_duration else None
+
     windows: List[Dict[str, Any]] = []
     start_idx = None
+
+    def _add_window(i0: int, i1: int):
+        start = tmp.loc[i0, "Interval Start"]
+        end = tmp.loc[i1, "Interval End"]
+        duration = end - start
+        if duration < min_td:
+            return
+        chunk = tmp.loc[i0:i1]
+        windows.append(
+            {
+                "start": pd.Timestamp(start).isoformat(),
+                "end": pd.Timestamp(end).isoformat(),
+                "duration_minutes": int(duration.total_seconds() // 60),
+                "avg_net_load": float(pd.to_numeric(chunk[netload_col], errors="coerce").mean())
+                if netload_col in chunk.columns
+                else None,
+                "avg_score": float(pd.to_numeric(chunk[score_col], errors="coerce").mean())
+                if score_col in chunk.columns
+                else None,
+            }
+        )
 
     for i, is_ok in enumerate(m):
         if is_ok and start_idx is None:
@@ -272,25 +288,25 @@ def contiguous_windows(
 
         if (not is_ok or i == len(m) - 1) and start_idx is not None:
             end_idx = i if (is_ok and i == len(m) - 1) else i - 1
-            start = tmp.loc[start_idx, "Interval Start"]
-            end = tmp.loc[end_idx, "Interval End"]
-            duration = end - start
 
-            if duration >= pd.Timedelta(min_duration):
-                chunk = tmp.loc[start_idx:end_idx]
-                windows.append(
-                    {
-                        "start": pd.Timestamp(start).isoformat(),
-                        "end": pd.Timestamp(end).isoformat(),
-                        "duration_minutes": int(duration.total_seconds() // 60),
-                        "avg_net_load": float(pd.to_numeric(chunk[netload_col], errors="coerce").mean())
-                        if netload_col in chunk.columns
-                        else None,
-                        "avg_score": float(pd.to_numeric(chunk[score_col], errors="coerce").mean())
-                        if score_col in chunk.columns
-                        else None,
-                    }
-                )
+            if not max_td:
+                _add_window(start_idx, end_idx)
+                start_idx = None
+                continue
+
+            # split into chunks <= max_td
+            chunk_start = start_idx
+            while chunk_start <= end_idx:
+                chunk_end = chunk_start
+                while chunk_end < end_idx:
+                    start = tmp.loc[chunk_start, "Interval Start"]
+                    next_end = tmp.loc[chunk_end + 1, "Interval End"]
+                    if (next_end - start) <= max_td:
+                        chunk_end += 1
+                    else:
+                        break
+                _add_window(chunk_start, chunk_end)
+                chunk_start = chunk_end + 1
 
             start_idx = None
 
@@ -303,6 +319,7 @@ def contiguous_windows(
 def build_next24_dataset(
     score_quantile: float = 0.80,
     min_duration: str = "60min",
+    max_duration: Optional[str] = None,
     green_weight: float = 0.5,
     cheap_weight: float = 0.5,
 ) -> Dict[str, Any]:
@@ -317,20 +334,16 @@ def build_next24_dataset(
     ren_fc = fetch_day_ahead_solar_wind_forecast(start_day, end_day)
     lmp_df = fetch_day_ahead_lmp(start_day, end_day)
 
-    # Single, clean merge
     df = load_fc.merge(ren_fc, on=["Interval Start", "Interval End"], how="left")
     df = df.merge(lmp_df, on=["Interval Start", "Interval End"], how="left")
 
-    # Net load proxy
     df["Net Load Forecast"] = pd.to_numeric(df["Load Forecast"], errors="coerce") - pd.to_numeric(
         df["Renewables Forecast"], errors="coerce"
     )
 
-    # Slice to next 24h
     df = df[(df["Interval Start"] >= horizon_start) & (df["Interval Start"] < horizon_end)].copy()
     df = df.sort_values("Interval Start").reset_index(drop=True)
 
-    # Scores
     df["Green Score"] = 1.0 - minmax_normalize(df["Net Load Forecast"])
 
     lmp_available = "lmp_usd_per_mwh" in df.columns and df["lmp_usd_per_mwh"].notna().any()
@@ -339,7 +352,6 @@ def build_next24_dataset(
     else:
         df["Cheap Score"] = pd.NA
 
-    # Weights sanity
     gw = float(green_weight)
     cw = float(cheap_weight)
     if gw < 0:
@@ -351,26 +363,24 @@ def build_next24_dataset(
         cw = 0.0
     wsum = gw + cw
 
-    # Combined score
     if lmp_available:
         df["Combined Score"] = (gw * df["Green Score"] + cw * df["Cheap Score"]) / wsum
     else:
-        # If no LMP, combined just behaves like green
         df["Combined Score"] = df["Green Score"]
 
-    # Thresholds + masks
     green_thr = safe_quantile(df["Green Score"], score_quantile)
     cheap_thr = safe_quantile(df["Cheap Score"], score_quantile) if lmp_available else None
 
     green_mask = (df["Green Score"] >= green_thr) if green_thr is not None else pd.Series([False] * len(df))
     cheap_mask = (df["Cheap Score"] >= cheap_thr) if cheap_thr is not None else pd.Series([False] * len(df))
-    both_mask = green_mask & cheap_mask if (green_thr is not None and cheap_thr is not None) else pd.Series([False] * len(df))
+    both_mask = (
+        (green_mask & cheap_mask) if (green_thr is not None and cheap_thr is not None) else pd.Series([False] * len(df))
+    )
 
-    windows_green = contiguous_windows(df, green_mask, min_duration=min_duration, score_col="Green Score")
-    windows_cheap = contiguous_windows(df, cheap_mask, min_duration=min_duration, score_col="Cheap Score")
-    windows_both = contiguous_windows(df, both_mask, min_duration=min_duration, score_col="Combined Score")
+    windows_green = contiguous_windows(df, green_mask, min_duration=min_duration, max_duration=max_duration, score_col="Green Score")
+    windows_cheap = contiguous_windows(df, cheap_mask, min_duration=min_duration, max_duration=max_duration, score_col="Cheap Score")
+    windows_both = contiguous_windows(df, both_mask, min_duration=min_duration, max_duration=max_duration, score_col="Combined Score")
 
-    # Serialize series for plotting (this is the part your frontend reads)
     series: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         series.append(
@@ -396,9 +406,9 @@ def build_next24_dataset(
             "horizon_start": horizon_start.isoformat(),
             "horizon_end": horizon_end.isoformat(),
             "cache_ttl_seconds": CACHE_TTL_SECONDS,
-            "strategy": "green+cheap",
             "score_quantile": score_quantile,
             "min_duration": min_duration,
+            "max_duration": max_duration,
             "weights": {"green": gw, "cheap": cw},
             "lmp_available": bool(lmp_available),
             "thresholds": {"green": green_thr, "cheap": cheap_thr},
@@ -408,8 +418,7 @@ def build_next24_dataset(
         "windows_green": windows_green,
         "windows_cheap": windows_cheap,
         "windows_both": windows_both,
-        # Backward-compatible alias: "windows" = intersection
-        "windows": windows_both,
+        "windows": windows_both,  # backward-compatible: intersection windows
     }
 
 
@@ -425,6 +434,7 @@ def home():
 def api_next24(
     score_quantile: float = Query(0.80, ge=0.50, le=0.95),
     min_duration: str = Query("60min"),
+    max_duration: Optional[str] = Query(None),
     green_weight: float = Query(0.5, ge=0.0, le=1.0),
     cheap_weight: float = Query(0.5, ge=0.0, le=1.0),
 ):
@@ -432,6 +442,7 @@ def api_next24(
         return build_next24_dataset(
             score_quantile=score_quantile,
             min_duration=min_duration,
+            max_duration=max_duration,
             green_weight=green_weight,
             cheap_weight=cheap_weight,
         )
