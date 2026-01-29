@@ -299,15 +299,12 @@ def _hourly_series(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
 
 
 def _time_features(times: pd.Series) -> pd.DataFrame:
-    """
-    Cyclical time features from timestamp.
-    """
-    # times is tz-aware
+    times = ensure_tz_series(times)
     t = times.dt.tz_convert(TZ)
+
     hour = t.dt.hour.astype(int)
     dow = t.dt.dayofweek.astype(int)
 
-    # cyclical encoding
     hour_rad = 2 * np.pi * hour / 24.0
     dow_rad = 2 * np.pi * dow / 7.0
 
@@ -320,7 +317,6 @@ def _time_features(times: pd.Series) -> pd.DataFrame:
         },
         index=times.index,
     )
-
 
 def _lag_features(values: pd.Series) -> pd.DataFrame:
     """
@@ -402,6 +398,28 @@ def _get_or_train_model(target: str, training_hourly: pd.DataFrame) -> Optional[
         log.exception("Ridge training failed for %s", target)
         return None
 
+def ensure_tz_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """
+    Ensure DatetimeIndex is tz-aware in TZ.
+    If tz-naive -> localize to TZ.
+    If tz-aware -> convert to TZ.
+    """
+    if idx is None or len(idx) == 0:
+        return idx
+    if idx.tz is None:
+        return idx.tz_localize(TZ)
+    return idx.tz_convert(TZ)
+
+
+def ensure_tz_series(s: pd.Series) -> pd.Series:
+    """
+    Ensure Series[datetime] is tz-aware in TZ.
+    """
+    s = pd.to_datetime(s, errors="coerce")
+    s = s.dropna()
+    if getattr(s.dt, "tz", None) is None:
+        return s.dt.tz_localize(TZ)
+    return s.dt.tz_convert(TZ)
 
 def _predict_future_hourly(
     history_hourly: pd.DataFrame,
@@ -473,7 +491,7 @@ def _predict_future_hourly(
             continue
 
         # Build feature row
-        time_feat = _time_features(pd.Series([t], dtype="datetime64[ns, US/Pacific]")).iloc[0]
+        time_feat = _time_features(pd.Series([t])).iloc[0]
 
         # compute lags/rolls from series
         lag1 = series.iloc[loc - 1]
@@ -671,7 +689,8 @@ def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out["is_predicted"] = out["time"] > cutoff_time
 
     # Future times for prediction (strictly > cutoff)
-    future_times = pd.DatetimeIndex(out.loc[out["time"] > cutoff_time, "time"].values).tz_convert(TZ)
+    future_times = pd.DatetimeIndex(pd.to_datetime(out.loc[out["time"] > cutoff_time, "time"]))
+    future_times = ensure_tz_index(future_times)
     if len(future_times) > 0:
         load_future = _predict_future_hourly(load_hist_hourly, future_times, load_model)
         ren_future = _predict_future_hourly(ren_hist_hourly, future_times, ren_model)
@@ -686,12 +705,14 @@ def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     if missing_load.any():
         # predict those timestamps using recursive routine, but we only need those times
-        tmiss = pd.DatetimeIndex(out.loc[missing_load, "time"].values).tz_convert(TZ)
+        tmiss = pd.DatetimeIndex(pd.to_datetime(out.loc[missing_load, "time"]))
+        tmiss = ensure_tz_index(tmiss)
         pred = _predict_future_hourly(load_hist_hourly, tmiss, load_model)
         out.loc[missing_load, "load_forecast_mw"] = pred.values
 
     if missing_ren.any():
-        tmiss = pd.DatetimeIndex(out.loc[missing_ren, "time"].values).tz_convert(TZ)
+        tmiss = pd.DatetimeIndex(pd.to_datetime(out.loc[missing_load, "time"]))
+        tmiss = ensure_tz_index(tmiss)
         pred = _predict_future_hourly(ren_hist_hourly, tmiss, ren_model)
         out.loc[missing_ren, "renewables_forecast_mw"] = pred.values
 
