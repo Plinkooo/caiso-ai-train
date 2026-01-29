@@ -704,17 +704,18 @@ def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     missing_ren = inside & out["renewables_forecast_mw"].isna()
 
     if missing_load.any():
-        # predict those timestamps using recursive routine, but we only need those times
-        tmiss = pd.DatetimeIndex(pd.to_datetime(out.loc[missing_load, "time"]))
-        tmiss = ensure_tz_index(tmiss)
+        tmiss_series = out.loc[missing_load, "time"]
+        tmiss = ensure_tz_index(pd.DatetimeIndex(pd.to_datetime(tmiss_series)))
         pred = _predict_future_hourly(load_hist_hourly, tmiss, load_model)
-        out.loc[missing_load, "load_forecast_mw"] = pred.values
+        pred_aligned = pred.reindex(tmiss)
+        out.loc[missing_load, "load_forecast_mw"] = pred_aligned.to_numpy()
 
     if missing_ren.any():
-        tmiss = pd.DatetimeIndex(pd.to_datetime(out.loc[missing_load, "time"]))
-        tmiss = ensure_tz_index(tmiss)
+        tmiss_series = out.loc[missing_ren, "time"]
+        tmiss = ensure_tz_index(pd.DatetimeIndex(pd.to_datetime(tmiss_series)))
         pred = _predict_future_hourly(ren_hist_hourly, tmiss, ren_model)
-        out.loc[missing_ren, "renewables_forecast_mw"] = pred.values
+        pred_aligned = pred.reindex(tmiss)
+        out.loc[missing_ren, "renewables_forecast_mw"] = pred_aligned.to_numpy()
 
     # Net load
     out["net_load_forecast_mw"] = out["load_forecast_mw"] - out["renewables_forecast_mw"]
