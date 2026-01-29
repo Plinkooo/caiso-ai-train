@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>CAISO Train Windows (Green + Cheap)</title>
+  <title>CAISO Energy Usage Tracker</title>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
   <style>
     body { font-family: system-ui, Arial; margin: 24px; background: #0b1220; color: #e8eefc; }
@@ -25,7 +25,6 @@
       background: rgba(255,255,255,0.08); color: #e8eefc;
     }
 
-    /* Two-column layout: charts left, sidebar right */
     .layout { display: grid; grid-template-columns: 1.5fr 1fr; gap: 12px; margin-top: 12px; align-items: start; }
     @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
 
@@ -40,21 +39,19 @@
 <body>
   <div class="row" style="justify-content: space-between;">
     <div>
-      <h1>CAISO Train Windows</h1>
-      <div class="muted">Forecast-based “green” + (when available) “cheap” signals, with recommended contiguous windows.</div>
+      <h1>CAISO Energy Usage</h1>
+      <div class="muted">Forecast based on green and cheap signals, with recommended windows.</div>
       <div id="meta" class="muted metaLine"></div>
     </div>
   </div>
 
   <div class="layout">
-    <!-- LEFT: Charts -->
     <div class="charts">
       <div class="card"><div id="chart1"></div></div>
       <div class="card"><div id="chart2"></div></div>
       <div class="card"><div id="chart3"></div></div>
     </div>
 
-    <!-- RIGHT: Controls + windows -->
     <div class="sidebar">
       <div class="card">
         <div class="row">
@@ -62,7 +59,7 @@
             <select id="hours">
               <option value="24" selected>24 hours</option>
               <option value="48">48 hours</option>
-              <option value="72">72 hours</option>
+              <option value="72">72 hours (Less reliable)</option>
             </select>
           </label>
 
@@ -144,10 +141,13 @@ function renderMeta(meta) {
   const parts = [];
   if (meta.horizon_start && meta.horizon_end) parts.push(`Horizon: ${meta.horizon_start} → ${meta.horizon_end}`);
   if (meta.horizon_hours) parts.push(`${meta.horizon_hours}h view`);
+  if (meta.forecast_cutoff_hours && meta.forecast_cutoff_time) {
+    parts.push(`Forecast cutoff: ${meta.forecast_cutoff_hours}h (${meta.forecast_cutoff_time})`);
+  }
   if (typeof meta.score_quantile === "number") parts.push(`Top quantile: ${meta.score_quantile}`);
   if (meta.min_duration) parts.push(`Min: ${meta.min_duration}`);
   if (meta.max_duration) parts.push(`Max: ${meta.max_duration}`);
-  parts.push(`LMP: ${meta.lmp_available ? "available" : "unavailable"}`);
+  parts.push(`LMP: ${meta.lmp_available ? "available (cuts off at cutoff)" : "unavailable"}`);
   document.getElementById("meta").textContent = parts.join(" | ");
 }
 
@@ -159,6 +159,15 @@ function windowsToHTML(wins, label) {
     (w.avg_score !== null && Number.isFinite(w.avg_score) ? ` | avg score ${w.avg_score.toFixed(3)}` : "") +
     `</li>`
   )).join("") + "</ul>";
+}
+
+function splitByPredicted(x, y, isPred) {
+  const xA = [], yA = [], xP = [], yP = [];
+  for (let i = 0; i < x.length; i++) {
+    if (isPred[i]) { xP.push(x[i]); yP.push(y[i]); }
+    else { xA.push(x[i]); yA.push(y[i]); }
+  }
+  return { xA, yA, xP, yP };
 }
 
 async function loadData() {
@@ -189,25 +198,36 @@ async function loadData() {
   const s = data.series || [];
   const x = s.map(r => r.t_start);
 
-  const load = s.map(r => r.load_forecast_mw);
-  const ren  = s.map(r => r.renewables_forecast_mw);
-  const net  = s.map(r => r.net_load_forecast_mw);
+  const load = s.map(r => (r.load_forecast_mw ?? NaN));
+  const ren  = s.map(r => (r.renewables_forecast_mw ?? NaN));
+  const net  = s.map(r => (r.net_load_forecast_mw ?? NaN));
 
   const green = s.map(r => (r.green_score ?? NaN));
   const cheap = s.map(r => (r.cheap_score ?? NaN));
   const combo = s.map(r => (r.combined_score ?? NaN));
 
   const lmp = s.map(r => (r.lmp_usd_per_mwh ?? NaN));
+  const isPred = s.map(r => !!r.is_predicted);
 
   // Highlight intersection windows on all charts
   const shapes = buildShapes(data.windows || []);
 
+  // Split forecast vs predicted for load/ren/net
+  const loadSplit = splitByPredicted(x, load, isPred);
+  const renSplit  = splitByPredicted(x, ren,  isPred);
+  const netSplit  = splitByPredicted(x, net,  isPred);
+
   Plotly.newPlot("chart1", [
-    { x, y: load, name: "Load forecast (MW)", mode: "lines" },
-    { x, y: ren,  name: "Renewables forecast (MW)", mode: "lines" },
-    { x, y: net,  name: "Net load (MW)", mode: "lines" },
+    { x: loadSplit.xA, y: loadSplit.yA, name: "Load (forecast)", mode: "lines" },
+    { x: loadSplit.xP, y: loadSplit.yP, name: "Load (predicted)", mode: "lines", line: { dash: "dot" } },
+
+    { x: renSplit.xA,  y: renSplit.yA,  name: "Renewables (forecast)", mode: "lines" },
+    { x: renSplit.xP,  y: renSplit.yP,  name: "Renewables (predicted)", mode: "lines", line: { dash: "dot" } },
+
+    { x: netSplit.xA,  y: netSplit.yA,  name: "Net load (forecast)", mode: "lines" },
+    { x: netSplit.xP,  y: netSplit.yP,  name: "Net load (predicted)", mode: "lines", line: { dash: "dot" } },
   ], {
-    title: "Forecast (Load / Renewables / Net Load)",
+    title: "Forecast (Load / Renewables / Net Load) - predicted beyond cutoff",
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(0,0,0,0)",
     font: { color: "#e8eefc" },
@@ -244,6 +264,7 @@ async function loadData() {
     annotations: scoreAnnotations
   }, { displayModeBar: false, responsive: true });
 
+  // LMP chart: it will naturally cut off because backend returns null after cutoff.
   const priceAnnotations = [];
   if (allMissing(lmp)) {
     priceAnnotations.push({
@@ -253,12 +274,20 @@ async function loadData() {
       showarrow: false,
       font: { size: 14, color: "#a8b3d6" }
     });
+  } else {
+    priceAnnotations.push({
+      xref: "paper", yref: "paper",
+      x: 0.01, y: 0.98, xanchor: "left", yanchor: "top",
+      text: "LMP is shown only where market data exists (cuts off at forecast cutoff).",
+      showarrow: false,
+      font: { size: 12, color: "#a8b3d6" }
+    });
   }
 
   Plotly.newPlot("chart3", [
     { x, y: lmp, name: "LMP ($/MWh)", mode: "lines" }
   ], {
-    title: "Price (LMP) - if available",
+    title: "Price (LMP) - cuts off when market data ends",
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(0,0,0,0)",
     font: { color: "#e8eefc" },
