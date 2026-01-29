@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import pytz
 from cachetools import TTLCache
@@ -15,6 +16,11 @@ from fastapi.staticfiles import StaticFiles
 
 import gridstatus
 
+# Ridge (safe + cached)
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
 # -----------------------------
 # Logging / Config
 # -----------------------------
@@ -23,22 +29,29 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 TZ = pytz.timezone("US/Pacific")
 
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default
+# CAISO fetch cache (fast refresh)
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min
 CACHE_MAXSIZE = int(os.getenv("CACHE_MAXSIZE", "256"))
-CACHE = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL_SECONDS)
+FETCH_CACHE = TTLCache(maxsize=CACHE_MAXSIZE, ttl=CACHE_TTL_SECONDS)
 
-# How far into the future we treat data as "forecast" (not predicted)
+# Model cache (don't retrain every request)
+MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "3600"))  # 60 min (your spec)
+MODEL_CACHE = TTLCache(maxsize=32, ttl=MODEL_TTL_SECONDS)
+
+# Training window
+TRAINING_DAYS = int(os.getenv("TRAINING_DAYS", "30"))  # your spec
+
+# Cutoff: <=30h use "forecast if available", >30h predict (your spec)
 FORECAST_CUTOFF_HOURS = float(os.getenv("FORECAST_CUTOFF_HOURS", "30"))
 
-# Training window for predictions (load + renewables)
-TRAINING_DAYS = int(os.getenv("TRAINING_DAYS", "30"))
-
-# LMP configuration (node/market vary by gridstatus version; we try best-effort)
+# LMP config (your spec)
 LMP_NODE = os.getenv("LMP_NODE", "TH_NP15_GEN-APND")
 LMP_MARKET_DA = os.getenv("LMP_MARKET_DA", "DAY_AHEAD_HOURLY")
 LMP_MARKET_RT = os.getenv("LMP_MARKET_RT", "REAL_TIME_5_MIN")
 
-# Renewables categories used when computing renewables MW from fuel mix
+# Ridge hyperparams (safe defaults; can tune later)
+RIDGE_ALPHA = float(os.getenv("RIDGE_ALPHA", "2.0"))
+
 RENEWABLE_KEYS = {
     "Solar",
     "Wind",
@@ -63,19 +76,19 @@ def _cache_key(prefix: str, **kwargs: Any) -> str:
     return prefix + "|" + "|".join(f"{k}={v}" for k, v in items)
 
 
-def _cached(prefix: str, **kwargs: Any) -> Optional[pd.DataFrame]:
-    return CACHE.get(_cache_key(prefix, **kwargs))
+def _cached(cache: TTLCache, prefix: str, **kwargs: Any) -> Optional[Any]:
+    return cache.get(_cache_key(prefix, **kwargs))
 
 
-def _set_cache(prefix: str, df: pd.DataFrame, **kwargs: Any) -> pd.DataFrame:
-    CACHE[_cache_key(prefix, **kwargs)] = df
-    return df
+def _set_cache(cache: TTLCache, prefix: str, value: Any, **kwargs: Any) -> Any:
+    cache[_cache_key(prefix, **kwargs)] = value
+    return value
 
 
 def _safe_fetch(fn, prefix: str, **kwargs: Any) -> pd.DataFrame:
-    cached_df = _cached(prefix, **kwargs)
-    if cached_df is not None:
-        return cached_df
+    cached = _cached(FETCH_CACHE, prefix, **kwargs)
+    if cached is not None:
+        return cached
 
     try:
         df = fn(**kwargs)
@@ -86,7 +99,7 @@ def _safe_fetch(fn, prefix: str, **kwargs: Any) -> pd.DataFrame:
     if df is None:
         df = pd.DataFrame()
 
-    return _set_cache(prefix, df, **kwargs)
+    return _set_cache(FETCH_CACHE, prefix, df, **kwargs)
 
 
 # -----------------------------
@@ -100,12 +113,9 @@ def to_iso(dt: datetime) -> str:
     return dt.astimezone(TZ).isoformat()
 
 
-def parse_time_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
-    """
-    Normalize a time column to 'time' and ensure tz-aware in US/Pacific.
-    """
+def parse_time_col(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return df, "time"
+        return pd.DataFrame()
 
     time_candidates = [
         "time",
@@ -115,7 +125,6 @@ def parse_time_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         "interval start",
         "Interval Start",
         "interval_start",
-        "Interval Start Time",
         "start",
         "Start",
     ]
@@ -129,15 +138,14 @@ def parse_time_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
 
     out = df.copy().rename(columns={time_col: "time"})
     out["time"] = pd.to_datetime(out["time"], errors="coerce")
+    out = out.dropna(subset=["time"])
 
-    # Localize/convert
     if getattr(out["time"].dt, "tz", None) is None:
         out["time"] = out["time"].dt.tz_localize(TZ)
     else:
         out["time"] = out["time"].dt.tz_convert(TZ)
 
-    out = out.dropna(subset=["time"])
-    return out, "time"
+    return out
 
 
 def first_numeric_col(df: pd.DataFrame, exclude: set[str]) -> Optional[str]:
@@ -150,17 +158,13 @@ def first_numeric_col(df: pd.DataFrame, exclude: set[str]) -> Optional[str]:
 
 
 # -----------------------------
-# Forecast fetchers (best-effort, version-tolerant)
+# Fetchers
 # -----------------------------
 def get_load_history(start: datetime, end: datetime) -> pd.DataFrame:
     return _safe_fetch(caiso.get_load, "load_history", date=start, end=end)
 
 
 def get_load_forecast(end: datetime) -> pd.DataFrame:
-    """
-    Try common method names across gridstatus versions.
-    If unavailable, return empty and we will rely on prediction.
-    """
     candidates = ["get_load_forecast", "get_demand_forecast"]
     for name in candidates:
         if hasattr(caiso, name):
@@ -174,10 +178,6 @@ def get_fuel_mix_history(start: datetime, end: datetime) -> pd.DataFrame:
 
 
 def get_fuel_mix_forecast(end: datetime) -> pd.DataFrame:
-    """
-    Fuel mix forecasts aren't always available in gridstatus versions.
-    If unavailable, return empty and we will predict renewables from history.
-    """
     candidates = ["get_fuel_mix_forecast", "get_renewables_forecast", "get_solar_and_wind_forecast"]
     for name in candidates:
         if hasattr(caiso, name):
@@ -187,20 +187,15 @@ def get_fuel_mix_forecast(end: datetime) -> pd.DataFrame:
 
 
 def get_lmp_series(end: datetime) -> Tuple[pd.DataFrame, bool]:
-    """
-    Fetch LMP as far as CAISO/adapter supports (DA and/or RT).
-    We will cut it off at FORECAST_CUTOFF_HOURS in the response.
-    Returns (df, available).
-    """
     if not hasattr(caiso, "get_lmp"):
         return pd.DataFrame(), False
 
-    start = now_pacific() - timedelta(hours=2)  # slight backfill
+    start = now_pacific() - timedelta(hours=2)
 
     frames: List[pd.DataFrame] = []
     available = False
 
-    # Day-ahead (forward-ish)
+    # DA
     try:
         df_da = _safe_fetch(
             caiso.get_lmp,
@@ -214,10 +209,9 @@ def get_lmp_series(end: datetime) -> Tuple[pd.DataFrame, bool]:
             frames.append(df_da)
             available = True
     except Exception:
-        # don't hard fail the whole endpoint because DA call failed
         log.info("DA LMP not available for this adapter/config")
 
-    # Real-time (optional)
+    # RT
     try:
         df_rt = _safe_fetch(
             caiso.get_lmp,
@@ -237,11 +231,8 @@ def get_lmp_series(end: datetime) -> Tuple[pd.DataFrame, bool]:
         return pd.DataFrame(), False
 
     df = pd.concat(frames, ignore_index=True)
+    df = parse_time_col(df)
 
-    # Normalize time column and pick price column
-    df, _ = parse_time_col(df)
-
-    # Common price column names vary; take first numeric after excluding time/location/market
     exclude = {"time", "Location", "location", "Market", "market", "LMP Type", "lmp_type"}
     price_col = None
     for c in df.columns:
@@ -252,41 +243,32 @@ def get_lmp_series(end: datetime) -> Tuple[pd.DataFrame, bool]:
             break
     if price_col is None:
         price_col = first_numeric_col(df, exclude=exclude)
-
     if price_col is None:
         return pd.DataFrame(), False
 
     out = df[["time", price_col]].rename(columns={price_col: "lmp_usd_per_mwh"})
     out = out.sort_values("time").drop_duplicates(subset=["time"], keep="last")
-    return out, True
+    return out, available
 
 
 # -----------------------------
 # Renewables from fuel mix
 # -----------------------------
 def compute_renewables_mw_from_fuel_mix(fuel_mix_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Output columns: time, renewables_mw
-    """
     if fuel_mix_df is None or fuel_mix_df.empty:
         return pd.DataFrame(columns=["time", "renewables_mw"])
 
-    df, _ = parse_time_col(fuel_mix_df)
+    df = parse_time_col(fuel_mix_df)
 
-    # Find numeric cols
     value_cols = [c for c in df.columns if c != "time" and pd.api.types.is_numeric_dtype(df[c])]
     if not value_cols:
         return pd.DataFrame(columns=["time", "renewables_mw"])
 
-    def is_renewable_col(col: str) -> bool:
-        for k in RENEWABLE_KEYS:
-            if k.lower() == col.lower():
-                return True
-        return False
+    def is_renewable(col: str) -> bool:
+        return any(k.lower() == col.lower() for k in RENEWABLE_KEYS)
 
-    ren_cols = [c for c in value_cols if is_renewable_col(c)]
+    ren_cols = [c for c in value_cols if is_renewable(c)]
     if not ren_cols:
-        # if adapter doesn't label fuel mix that way, we can't compute ren MW
         return pd.DataFrame(columns=["time", "renewables_mw"])
 
     out = pd.DataFrame({"time": df["time"]})
@@ -296,71 +278,232 @@ def compute_renewables_mw_from_fuel_mix(fuel_mix_df: pd.DataFrame) -> pd.DataFra
 
 
 # -----------------------------
-# Simple prediction model (median by hour-of-week)
+# Ridge feature engineering (hourly)
 # -----------------------------
-@dataclass
-class HourOfWeekMedianModel:
-    medians: Dict[int, float]
-    fallback: float
-
-    @staticmethod
-    def fit(ts: pd.Series, values: pd.Series) -> "HourOfWeekMedianModel":
-        # hour-of-week: Monday 0:00 = 0 ... Sunday 23:00 = 167
-        how = (ts.dt.dayofweek * 24 + ts.dt.hour).astype(int)
-        df = pd.DataFrame({"how": how, "v": values})
-        df = df[pd.notna(df["v"])]
-
-        if df.empty:
-            return HourOfWeekMedianModel(medians={}, fallback=float("nan"))
-
-        med = df.groupby("how")["v"].median().to_dict()
-        fallback = float(df["v"].median())
-        return HourOfWeekMedianModel(medians=med, fallback=fallback)
-
-    def predict(self, ts: pd.Series) -> pd.Series:
-        how = (ts.dt.dayofweek * 24 + ts.dt.hour).astype(int)
-        preds = how.map(lambda k: self.medians.get(int(k), self.fallback))
-        return preds.astype(float)
-
-
-def build_training_series_load(now: datetime) -> pd.DataFrame:
-    end = now
-    start = end - timedelta(days=TRAINING_DAYS)
-    df = get_load_history(start, end)
+def _hourly_series(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    Returns hourly mean series with columns [time, value] on an hourly grid.
+    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["time", "value"])
 
-    df, _ = parse_time_col(df)
-    # pick load column
-    exclude = {"time"}
-    load_col = None
-    for c in df.columns:
-        if c.lower() in {"load", "load (mw)", "mw", "demand", "demand (mw)"} and c not in exclude:
-            load_col = c
-            break
-    if load_col is None:
-        load_col = first_numeric_col(df, exclude=exclude)
-    if load_col is None:
+    df = parse_time_col(df)
+    if value_col not in df.columns:
         return pd.DataFrame(columns=["time", "value"])
 
-    out = df[["time", load_col]].rename(columns={load_col: "value"})
-    out = out.sort_values("time").drop_duplicates(subset=["time"], keep="last")
-    return out
+    tmp = df[["time", value_col]].rename(columns={value_col: "value"}).copy()
+    tmp["time"] = tmp["time"].dt.floor("H")
+    tmp = tmp.groupby("time")["value"].mean().reset_index()
+    tmp = tmp.sort_values("time")
+    return tmp
 
 
-def build_training_series_renewables(now: datetime) -> pd.DataFrame:
-    end = now
-    start = end - timedelta(days=TRAINING_DAYS)
-    fm = get_fuel_mix_history(start, end)
-    ren = compute_renewables_mw_from_fuel_mix(fm)
-    if ren.empty:
-        return pd.DataFrame(columns=["time", "value"])
-    out = ren.rename(columns={"renewables_mw": "value"})
-    return out
+def _time_features(times: pd.Series) -> pd.DataFrame:
+    """
+    Cyclical time features from timestamp.
+    """
+    # times is tz-aware
+    t = times.dt.tz_convert(TZ)
+    hour = t.dt.hour.astype(int)
+    dow = t.dt.dayofweek.astype(int)
+
+    # cyclical encoding
+    hour_rad = 2 * np.pi * hour / 24.0
+    dow_rad = 2 * np.pi * dow / 7.0
+
+    return pd.DataFrame(
+        {
+            "hour_sin": np.sin(hour_rad),
+            "hour_cos": np.cos(hour_rad),
+            "dow_sin": np.sin(dow_rad),
+            "dow_cos": np.cos(dow_rad),
+        },
+        index=times.index,
+    )
+
+
+def _lag_features(values: pd.Series) -> pd.DataFrame:
+    """
+    Lag and rolling stats features from a numeric series (hourly).
+    IMPORTANT: this is computed on a *complete* time-aligned series.
+    """
+    v = values.astype(float)
+    return pd.DataFrame(
+        {
+            "lag1": v.shift(1),
+            "lag24": v.shift(24),
+            "roll6": v.rolling(6).mean(),
+            "roll24": v.rolling(24).mean(),
+        },
+        index=values.index,
+    )
+
+
+@dataclass
+class RidgeForecaster:
+    pipeline: Pipeline
+
+    def predict_next(self, X_row: np.ndarray) -> float:
+        return float(self.pipeline.predict(X_row.reshape(1, -1))[0])
+
+
+def _fit_ridge_model(training_hourly: pd.DataFrame) -> Optional[RidgeForecaster]:
+    """
+    Train ridge regression on hourly series with time+lag features.
+    Returns None if not enough data.
+    """
+    if training_hourly is None or training_hourly.empty:
+        return None
+
+    df = training_hourly.copy().reset_index(drop=True)
+    df = df.sort_values("time")
+
+    # Build features
+    tf = _time_features(df["time"])
+    lf = _lag_features(df["value"])
+    X = pd.concat([tf, lf], axis=1)
+
+    y = df["value"].astype(float)
+
+    # Drop rows with missing lags/rolls (first ~24 hours)
+    ok = ~X.isna().any(axis=1) & ~y.isna()
+    X = X.loc[ok]
+    y = y.loc[ok]
+
+    if len(X) < 200:  # safety: need enough hourly points
+        return None
+
+    pipe = Pipeline(
+        steps=[
+            ("scaler", StandardScaler(with_mean=True, with_std=True)),
+            ("ridge", Ridge(alpha=RIDGE_ALPHA, random_state=42)),
+        ]
+    )
+    pipe.fit(X.values, y.values)
+    return RidgeForecaster(pipeline=pipe)
+
+
+def _get_or_train_model(target: str, training_hourly: pd.DataFrame) -> Optional[RidgeForecaster]:
+    """
+    Cached model: retrains at most every MODEL_TTL_SECONDS.
+    """
+    key = _cache_key("ridge_model", target=target, days=TRAINING_DAYS, alpha=RIDGE_ALPHA)
+    cached = MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        model = _fit_ridge_model(training_hourly)
+        if model is None:
+            return None
+        MODEL_CACHE[key] = model
+        return model
+    except Exception:
+        log.exception("Ridge training failed for %s", target)
+        return None
+
+
+def _predict_future_hourly(
+    history_hourly: pd.DataFrame,
+    future_times: pd.DatetimeIndex,
+    model: Optional[RidgeForecaster],
+) -> pd.Series:
+    """
+    Recursive hourly prediction using ridge (so lags use predicted values).
+    Fallback: hour-of-week median if ridge unavailable.
+    """
+    # Build a full timeline including history and future
+    hist = history_hourly.copy().sort_values("time")
+    hist = hist.dropna(subset=["time"])
+    hist = hist.set_index("time")
+
+    # Ensure hourly frequency on history (reindex + interpolate small gaps)
+    if not hist.empty:
+        full_hist_index = pd.date_range(hist.index.min().floor("H"), hist.index.max().floor("H"), freq="1H", tz=TZ)
+        hist = hist.reindex(full_hist_index)
+        # Don't get fancy: fill small gaps via time interpolation, remaining via median
+        hist["value"] = hist["value"].interpolate(method="time", limit=6)
+        hist["value"] = hist["value"].fillna(hist["value"].median())
+
+    # Fallback medians for hour-of-week
+    def hour_of_week(dt: pd.Timestamp) -> int:
+        return int(dt.dayofweek) * 24 + int(dt.hour)
+
+    how_medians: Dict[int, float] = {}
+    fallback = float("nan")
+    if not hist.empty:
+        how = [hour_of_week(t) for t in hist.index]
+        tmp = pd.DataFrame({"how": how, "v": hist["value"].values})
+        how_medians = tmp.groupby("how")["v"].median().to_dict()
+        fallback = float(tmp["v"].median())
+
+    # Start series with history values
+    combined_index = hist.index.union(future_times)
+    combined_index = combined_index.sort_values()
+    series = pd.Series(index=combined_index, dtype=float)
+
+    if not hist.empty:
+        series.loc[hist.index] = hist["value"].astype(float).values
+
+    # Predict forward one hour at a time
+    for t in future_times:
+        if pd.notna(series.get(t)):
+            continue
+
+        # Build features using current series (lags/rolls)
+        # Need previous hours present; if not, fallback
+        # Create a small window up to t
+        # We'll compute lags on a dataframe for simplicity
+        idx = series.index
+        # Make sure t exists
+        if t not in idx:
+            continue
+
+        # Construct a mini frame
+        # (rolling needs enough points; if not, fallback)
+        loc = idx.get_loc(t)
+        if isinstance(loc, slice) or isinstance(loc, np.ndarray):
+            # shouldn't happen
+            loc = int(loc[0])
+
+        # If we don't have 24h of back context, fallback
+        if loc < 25:
+            pred = how_medians.get(hour_of_week(t), fallback)
+            series.loc[t] = pred
+            continue
+
+        # Build feature row
+        time_feat = _time_features(pd.Series([t], dtype="datetime64[ns, US/Pacific]")).iloc[0]
+
+        # compute lags/rolls from series
+        lag1 = series.iloc[loc - 1]
+        lag24 = series.iloc[loc - 24]
+        roll6 = series.iloc[loc - 6 : loc].mean()
+        roll24 = series.iloc[loc - 24 : loc].mean()
+
+        # If missing for any reason, fallback
+        if any(pd.isna(x) for x in [lag1, lag24, roll6, roll24]):
+            pred = how_medians.get(hour_of_week(t), fallback)
+            series.loc[t] = pred
+            continue
+
+        X_row = np.array([time_feat["hour_sin"], time_feat["hour_cos"], time_feat["dow_sin"], time_feat["dow_cos"], lag1, lag24, roll6, roll24], dtype=float)
+
+        if model is None:
+            pred = how_medians.get(hour_of_week(t), fallback)
+        else:
+            try:
+                pred = model.predict_next(X_row)
+            except Exception:
+                pred = how_medians.get(hour_of_week(t), fallback)
+
+        series.loc[t] = pred
+
+    return series.loc[future_times]
 
 
 # -----------------------------
-# Window scoring + building
+# Scoring + windows
 # -----------------------------
 def normalize_01(x: pd.Series) -> pd.Series:
     x = x.astype(float)
@@ -375,16 +518,11 @@ def normalize_01(x: pd.Series) -> pd.Series:
 
 
 def duration_to_minutes(s: str) -> int:
-    # e.g., "30min", "60min", "120min"
     if not s:
         return 0
     s = s.strip().lower()
     if s.endswith("min"):
         return int(float(s[:-3]))
-    if s.endswith("h") or s.endswith("hr") or s.endswith("hrs"):
-        # not used by your UI right now
-        num = "".join(ch for ch in s if ch.isdigit() or ch == ".")
-        return int(float(num) * 60)
     raise ValueError(f"Unsupported duration: {s}")
 
 
@@ -395,20 +533,12 @@ def build_windows(
     min_minutes: int,
     max_minutes: Optional[int],
 ) -> List[Dict[str, Any]]:
-    """
-    Finds contiguous blocks where score >= quantile threshold.
-    Assumes series_df is hourly, sorted by time.
-    """
-    df = series_df.copy()
-    df = df.sort_values("time").reset_index(drop=True)
-
+    df = series_df.copy().sort_values("time").reset_index(drop=True)
     s = df[score_col].astype(float)
     thresh = float(s.quantile(score_quantile)) if s.dropna().size else float("nan")
-
     good = s >= thresh
-    windows = []
 
-    # each row is 1 hour
+    windows: List[Dict[str, Any]] = []
     i = 0
     while i < len(df):
         if not bool(good.iloc[i]):
@@ -435,15 +565,13 @@ def build_windows(
                     "avg_score": avg_score,
                 }
             )
+
         i = j
 
     return windows
 
 
 def intersect_windows(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Simple interval intersection between two window lists.
-    """
     out: List[Dict[str, Any]] = []
 
     def parse_iso(x: str) -> datetime:
@@ -471,107 +599,113 @@ def intersect_windows(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[
                         "avg_score": None,
                     }
                 )
-    # de-dup / sort
-    out = sorted(out, key=lambda w: w["start"])
-    return out
+    return sorted(out, key=lambda w: w["start"])
 
 
 # -----------------------------
-# Core builder: /api/next24 schema (keeps your UI working)
+# Build series (keeps your /api/next24 schema)
 # -----------------------------
 def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Build an HOURLY time series for horizon 'hours':
-      - Up to cutoff: uses actual forecast (if available), else predicted
-      - Beyond cutoff: predicted
-    LMP: filled only up to cutoff (or whatever is available), never predicted.
-    """
     now = now_pacific()
     horizon_end = now + timedelta(hours=hours)
     cutoff_time = now + timedelta(hours=FORECAST_CUTOFF_HOURS)
 
-    # Timeline: hourly points starting from the next hour boundary
+    # hourly grid starting next hour
     start_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
     times = pd.date_range(start=start_hour, end=horizon_end, freq="1H", tz=TZ, inclusive="left")
     base = pd.DataFrame({"time": times})
 
-    # --- Load: forecast best-effort ---
-    lf = get_load_forecast(end=horizon_end)
-    lf, _ = parse_time_col(lf)
+    # --- Forecast (best effort) ---
+    lf_raw = get_load_forecast(end=horizon_end)
+    lf_raw = parse_time_col(lf_raw)
     load_col = None
-    if lf is not None and not lf.empty:
-        # pick load column
-        for c in lf.columns:
+    if not lf_raw.empty:
+        for c in lf_raw.columns:
             if c.lower() in {"load", "load (mw)", "mw", "demand", "demand (mw)"} and c != "time":
                 load_col = c
                 break
         if load_col is None:
-            load_col = first_numeric_col(lf, exclude={"time"})
+            load_col = first_numeric_col(lf_raw, exclude={"time"})
     load_forecast = pd.DataFrame(columns=["time", "load_forecast_mw"])
-    if lf is not None and not lf.empty and load_col:
-        load_forecast = lf[["time", load_col]].rename(columns={load_col: "load_forecast_mw"})
-        load_forecast = load_forecast.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+    if not lf_raw.empty and load_col:
+        load_forecast = _hourly_series(lf_raw, load_col).rename(columns={"value": "load_forecast_mw"})
 
-    # --- Renewables: from fuel mix forecast (if available), else history-prediction only ---
     fm_f = get_fuel_mix_forecast(end=horizon_end)
     ren_forecast = compute_renewables_mw_from_fuel_mix(fm_f)
     if not ren_forecast.empty:
-        ren_forecast = ren_forecast.rename(columns={"renewables_mw": "renewables_forecast_mw"})
+        ren_forecast = _hourly_series(ren_forecast, "renewables_mw").rename(columns={"value": "renewables_forecast_mw"})
+    else:
+        ren_forecast = pd.DataFrame(columns=["time", "renewables_forecast_mw"])
 
-    # --- LMP: fetch and cut off later ---
-    lmp_df, lmp_available = get_lmp_series(end=horizon_end)
+    # Merge forecasts
+    out = base.merge(load_forecast, on="time", how="left")
+    out = out.merge(ren_forecast, on="time", how="left")
 
-    # --- Fit models from history for prediction ---
-    train_load = build_training_series_load(now)
-    train_ren = build_training_series_renewables(now)
+    # --- Training data (history) ---
+    train_end = now
+    train_start = train_end - timedelta(days=TRAINING_DAYS)
 
-    load_model = HourOfWeekMedianModel.fit(train_load["time"], train_load["value"]) if not train_load.empty else HourOfWeekMedianModel({}, float("nan"))
-    ren_model = HourOfWeekMedianModel.fit(train_ren["time"], train_ren["value"]) if not train_ren.empty else HourOfWeekMedianModel({}, float("nan"))
+    # Load history hourly
+    lh = get_load_history(train_start, train_end)
+    lh = parse_time_col(lh)
+    hist_load_col = None
+    if not lh.empty:
+        for c in lh.columns:
+            if c.lower() in {"load", "load (mw)", "mw", "demand", "demand (mw)"} and c != "time":
+                hist_load_col = c
+                break
+        if hist_load_col is None:
+            hist_load_col = first_numeric_col(lh, exclude={"time"})
+    load_hist_hourly = _hourly_series(lh, hist_load_col) if (hist_load_col and not lh.empty) else pd.DataFrame(columns=["time", "value"])
 
-    # --- Merge forecasts onto timeline (nearest hour) ---
-    out = base.copy()
+    # Renewables history hourly
+    fm_h = get_fuel_mix_history(train_start, train_end)
+    ren_h = compute_renewables_mw_from_fuel_mix(fm_h)
+    ren_hist_hourly = _hourly_series(ren_h, "renewables_mw") if not ren_h.empty else pd.DataFrame(columns=["time", "value"])
 
-    def merge_hourly(out_df: pd.DataFrame, src: pd.DataFrame, value_col: str) -> pd.DataFrame:
-        if src is None or src.empty:
-            out_df[value_col] = float("nan")
-            return out_df
-        src2 = src.copy()
-        src2["time_hr"] = src2["time"].dt.floor("H")
-        src2 = src2.groupby("time_hr")[value_col].mean().reset_index().rename(columns={"time_hr": "time"})
-        out_df = out_df.merge(src2, on="time", how="left")
-        return out_df
+    # --- Ridge models (cached) ---
+    load_model = _get_or_train_model("load", load_hist_hourly)
+    ren_model = _get_or_train_model("renewables", ren_hist_hourly)
 
-    out = merge_hourly(out, load_forecast, "load_forecast_mw")
-    out = merge_hourly(out, ren_forecast, "renewables_forecast_mw")
-
-    # --- Predict beyond cutoff (and also fill missing within cutoff) ---
+    # --- Predict beyond cutoff (and fill missing within cutoff) ---
     out["is_predicted"] = out["time"] > cutoff_time
 
-    # predicted values
-    load_pred = load_model.predict(out["time"].dt.tz_convert(TZ).dt.tz_localize(None))
-    ren_pred = ren_model.predict(out["time"].dt.tz_convert(TZ).dt.tz_localize(None))
+    # Future times for prediction (strictly > cutoff)
+    future_times = pd.DatetimeIndex(out.loc[out["time"] > cutoff_time, "time"].values).tz_convert(TZ)
+    if len(future_times) > 0:
+        load_future = _predict_future_hourly(load_hist_hourly, future_times, load_model)
+        ren_future = _predict_future_hourly(ren_hist_hourly, future_times, ren_model)
 
-    # apply rules:
-    # - if time > cutoff -> predicted
-    # - else keep forecast if present, else predicted (but still mark is_predicted False)
-    out.loc[out["time"] > cutoff_time, "load_forecast_mw"] = load_pred[out["time"] > cutoff_time].values
-    out.loc[out["time"] > cutoff_time, "renewables_forecast_mw"] = ren_pred[out["time"] > cutoff_time].values
+        out.loc[out["time"] > cutoff_time, "load_forecast_mw"] = load_future.values
+        out.loc[out["time"] > cutoff_time, "renewables_forecast_mw"] = ren_future.values
 
-    out.loc[out["time"] <= cutoff_time, "load_forecast_mw"] = out.loc[out["time"] <= cutoff_time, "load_forecast_mw"].fillna(load_pred[out["time"] <= cutoff_time].values)
-    out.loc[out["time"] <= cutoff_time, "renewables_forecast_mw"] = out.loc[out["time"] <= cutoff_time, "renewables_forecast_mw"].fillna(ren_pred[out["time"] <= cutoff_time].values)
+    # If forecast missing inside cutoff, backfill with ridge predictions too (but not marked predicted)
+    inside = out["time"] <= cutoff_time
+    missing_load = inside & out["load_forecast_mw"].isna()
+    missing_ren = inside & out["renewables_forecast_mw"].isna()
 
-    # net load
+    if missing_load.any():
+        # predict those timestamps using recursive routine, but we only need those times
+        tmiss = pd.DatetimeIndex(out.loc[missing_load, "time"].values).tz_convert(TZ)
+        pred = _predict_future_hourly(load_hist_hourly, tmiss, load_model)
+        out.loc[missing_load, "load_forecast_mw"] = pred.values
+
+    if missing_ren.any():
+        tmiss = pd.DatetimeIndex(out.loc[missing_ren, "time"].values).tz_convert(TZ)
+        pred = _predict_future_hourly(ren_hist_hourly, tmiss, ren_model)
+        out.loc[missing_ren, "renewables_forecast_mw"] = pred.values
+
+    # Net load
     out["net_load_forecast_mw"] = out["load_forecast_mw"] - out["renewables_forecast_mw"]
 
-    # green score: higher renewables share
-    # (we’ll compute share as renewables/load, clipped to [0,1], and normalize)
-    share = out["renewables_forecast_mw"] / out["load_forecast_mw"]
-    share = share.clip(lower=0, upper=1)
+    # Green score: renewables share (normalized)
+    share = (out["renewables_forecast_mw"] / out["load_forecast_mw"]).clip(lower=0, upper=1)
     out["green_score"] = normalize_01(share)
 
-    # cheap score: lower LMP is better; we will only fill up to cutoff, never predicted
+    # LMP (market-only) - fill hourly and cut off at cutoff, never predicted
     out["lmp_usd_per_mwh"] = float("nan")
-    if lmp_available and lmp_df is not None and not lmp_df.empty:
+    lmp_df, lmp_available = get_lmp_series(end=horizon_end)
+    if lmp_available and not lmp_df.empty:
         lmp_df = lmp_df.copy()
         lmp_df["time"] = lmp_df["time"].dt.floor("H")
         lmp_hourly = lmp_df.groupby("time")["lmp_usd_per_mwh"].mean().reset_index()
@@ -580,15 +714,14 @@ def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             out["lmp_usd_per_mwh"] = out["lmp_usd_per_mwh_y"]
             out = out.drop(columns=["lmp_usd_per_mwh_y"])
 
-    # cut LMP at cutoff
+    # hard cutoff for LMP
     out.loc[out["time"] > cutoff_time, "lmp_usd_per_mwh"] = float("nan")
 
-    # cheap score: invert normalized price (only where LMP exists)
+    # Cheap score (only where LMP exists)
     if out["lmp_usd_per_mwh"].dropna().empty:
         out["cheap_score"] = float("nan")
     else:
-        price_norm = normalize_01(out["lmp_usd_per_mwh"])
-        out["cheap_score"] = 1.0 - price_norm
+        out["cheap_score"] = 1.0 - normalize_01(out["lmp_usd_per_mwh"])
 
     meta = {
         "horizon_start": to_iso(start_hour),
@@ -597,6 +730,9 @@ def build_series(hours: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "forecast_cutoff_hours": FORECAST_CUTOFF_HOURS,
         "forecast_cutoff_time": to_iso(cutoff_time),
         "lmp_available": bool(lmp_available and not out["lmp_usd_per_mwh"].dropna().empty),
+        "ridge_cached_ttl_seconds": MODEL_TTL_SECONDS,
+        "ridge_alpha": RIDGE_ALPHA,
+        "training_days": TRAINING_DAYS,
     }
 
     return out, meta
@@ -615,8 +751,10 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "timezone": str(TZ),
-        "cache_ttl_seconds": CACHE_TTL_SECONDS,
-        "cache_size": len(CACHE),
+        "fetch_cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "fetch_cache_size": len(FETCH_CACHE),
+        "model_cache_ttl_seconds": MODEL_TTL_SECONDS,
+        "model_cache_size": len(MODEL_CACHE),
         "training_days": TRAINING_DAYS,
         "forecast_cutoff_hours": FORECAST_CUTOFF_HOURS,
         "lmp_node": LMP_NODE,
@@ -633,20 +771,11 @@ def api_next24(
     green_weight: float = Query(0.5, ge=0.0, le=1.0),
     cheap_weight: float = Query(0.5, ge=0.0, le=1.0),
 ) -> JSONResponse:
-    """
-    Keeps your UI schema:
-      - series[].t_start
-      - load_forecast_mw / renewables_forecast_mw / net_load_forecast_mw
-      - green_score / cheap_score / combined_score
-      - lmp_usd_per_mwh (cut off at cutoff, never predicted)
-      - windows + windows_green + windows_cheap + windows_both
-    """
     series_df, meta = build_series(hours=hours)
 
     min_minutes = duration_to_minutes(min_duration)
     max_minutes = duration_to_minutes(max_duration) if max_duration else None
 
-    # combined score (only uses cheap where available; if cheap missing, combine will follow green_weight only)
     gw = float(green_weight)
     cw = float(cheap_weight)
     denom = gw + cw
@@ -655,23 +784,17 @@ def api_next24(
 
     gs = series_df["green_score"].astype(float)
     cs = series_df["cheap_score"].astype(float)
-
-    # If cheap is missing, treat it as NaN and weight will effectively reduce; fill NaN with 0.5 neutral for combination
     cs_for_combo = cs.fillna(0.5)
-
     series_df["combined_score"] = (gw * gs + cw * cs_for_combo) / denom
 
-    # Windows from scores
     windows_green = build_windows(series_df, "green_score", score_quantile, min_minutes, max_minutes)
     windows_cheap = build_windows(series_df, "cheap_score", score_quantile, min_minutes, max_minutes) if meta["lmp_available"] else []
     windows_both = intersect_windows(windows_green, windows_cheap) if windows_green and windows_cheap else []
 
-    # Default windows = both if available else combined score blocks
     windows_default = windows_both
     if not windows_default:
         windows_default = build_windows(series_df, "combined_score", score_quantile, min_minutes, max_minutes)
 
-    # Render series records matching your current UI field names
     records: List[Dict[str, Any]] = []
     for _, r in series_df.iterrows():
         records.append(
@@ -688,7 +811,6 @@ def api_next24(
             }
         )
 
-    # Meta used by your UI
     meta_out = {
         **meta,
         "score_quantile": float(score_quantile),

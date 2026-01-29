@@ -5,4 +5,5 @@ cachetools==5.5.0
 pytz==2024.1
 python-dateutil==2.9.0.post0
 gridstatus>=0.34.0
+scikit-learn
 

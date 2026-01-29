@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>CAISO Energy Usage Tracker</title>
+  <title>CAISO Train Windows (Green + Cheap)</title>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
   <style>
     body { font-family: system-ui, Arial; margin: 24px; background: #0b1220; color: #e8eefc; }
@@ -40,7 +40,7 @@
   <div class="row" style="justify-content: space-between;">
     <div>
       <h1>CAISO Energy Usage</h1>
-      <div class="muted">Forecast based on green and cheap signals, with recommended windows.</div>
+      <div class="muted">Forecast-based on green and cheap signals, with recommended windows.</div>
       <div id="meta" class="muted metaLine"></div>
     </div>
   </div>
@@ -144,9 +144,8 @@ function renderMeta(meta) {
   if (meta.forecast_cutoff_hours && meta.forecast_cutoff_time) {
     parts.push(`Forecast cutoff: ${meta.forecast_cutoff_hours}h (${meta.forecast_cutoff_time})`);
   }
-  if (typeof meta.score_quantile === "number") parts.push(`Top quantile: ${meta.score_quantile}`);
-  if (meta.min_duration) parts.push(`Min: ${meta.min_duration}`);
-  if (meta.max_duration) parts.push(`Max: ${meta.max_duration}`);
+  if (meta.training_days) parts.push(`Training: ${meta.training_days}d`);
+  if (meta.ridge_cached_ttl_seconds) parts.push(`Ridge retrain max: ${meta.ridge_cached_ttl_seconds}s`);
   parts.push(`LMP: ${meta.lmp_available ? "available (cuts off at cutoff)" : "unavailable"}`);
   document.getElementById("meta").textContent = parts.join(" | ");
 }
@@ -209,10 +208,9 @@ async function loadData() {
   const lmp = s.map(r => (r.lmp_usd_per_mwh ?? NaN));
   const isPred = s.map(r => !!r.is_predicted);
 
-  // Highlight intersection windows on all charts
   const shapes = buildShapes(data.windows || []);
 
-  // Split forecast vs predicted for load/ren/net
+  // Split predicted vs forecast for chart 1
   const loadSplit = splitByPredicted(x, load, isPred);
   const renSplit  = splitByPredicted(x, ren,  isPred);
   const netSplit  = splitByPredicted(x, net,  isPred);
@@ -264,7 +262,7 @@ async function loadData() {
     annotations: scoreAnnotations
   }, { displayModeBar: false, responsive: true });
 
-  // LMP chart: it will naturally cut off because backend returns null after cutoff.
+  // LMP chart: backend returns null after cutoff, so it naturally stops
   const priceAnnotations = [];
   if (allMissing(lmp)) {
     priceAnnotations.push({
@@ -278,7 +276,7 @@ async function loadData() {
     priceAnnotations.push({
       xref: "paper", yref: "paper",
       x: 0.01, y: 0.98, xanchor: "left", yanchor: "top",
-      text: "LMP is shown only where market data exists (cuts off at forecast cutoff).",
+      text: "LMP shown only where market data exists (cuts off at cutoff).",
       showarrow: false,
       font: { size: 12, color: "#a8b3d6" }
     });
