@@ -36,7 +36,7 @@
 
     <div class="header">
       <div>
-        <div class="title">CAISO - Next 24–72 Hours</div>
+        <div class="title">CAISO - Next 24-72 Hours</div>
         <div class="subtitle">Green + Cheap training windows (forecast to cutoff, ridge beyond)</div>
       </div>
     </div>
@@ -65,7 +65,7 @@
             </div>
             <div>
               <label for="q">Score quantile</label>
-              <input id="q" type="number" value="0.2" step="0.05" min="0" max="1" />
+              <input id="q" type="number" value="0.8" step="0.05" min="0" max="1" />
             </div>
             <div>
               <label for="minDur">Min duration (min)</label>
@@ -121,7 +121,6 @@
       }));
     }
 
-    // Base green fill for all windows
     function buildGreenFillShapes(windows) {
       if (!Array.isArray(windows)) return [];
       return windows.map(function (w) {
@@ -139,7 +138,6 @@
       });
     }
 
-    // Overlay outline for "predicted" windows
     function buildPredictedWindowOutlines(windows, meta) {
       if (!Array.isArray(windows) || !meta || !meta.forecast_cutoff_time) return [];
       var cutoff = new Date(meta.forecast_cutoff_time).getTime();
@@ -161,7 +159,6 @@
         });
     }
 
-    // Predicted region shading (light red)
     function predictedRegionShade(meta) {
       if (!meta || !meta.forecast_cutoff_time || !meta.horizon_end) return null;
       return {
@@ -243,12 +240,15 @@
       return start > cutoff;
     }
 
+    // FIXED: no stray quotes, safe bullet, clean concatenation
     function windowsToHTML(wins, label, meta) {
       if (!wins || wins.length === 0) {
         return '<div class="muted">No ' + label + ' windows found.</div>';
       }
 
-      var sorted = wins.slice().sort(function (a, b) { return new Date(a.start) - new Date(b.start); });
+      var sorted = wins.slice().sort(function (a, b) {
+        return new Date(a.start) - new Date(b.start);
+      });
 
       var items = sorted.map(function (w) {
         var pred = isPredictedWindow(w, meta);
@@ -265,25 +265,25 @@
           extras.push("Avg score: <b>" + w.avg_score.toFixed(3) + "</b>");
         }
 
-        var predPill = pred ? (
-          '<div class="muted" style="border: 1px solid rgba(255,80,80,0.35); background: rgba(255,80,80,0.10); color: #ffd6d6; padding: 4px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;">Predicted</div>'
-        ) : "";
+        var predPill = pred
+          ? '<div class="muted" style="border: 1px solid rgba(255,80,80,0.35); background: rgba(255,80,80,0.10); color: #ffd6d6; padding: 4px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;">Predicted</div>'
+          : "";
 
-        var extrasHtml = extras.length ? (
-          '<div class="muted" style="margin-top:8px; display:flex; gap:14px; flex-wrap:wrap;">' +
-            extras.map(function (x) { return "<div>" + x + "</div>"; }).join("") +
-          "</div>"
-        ) : "";
+        var extrasHtml = extras.length
+          ? '<div class="muted" style="margin-top:8px; display:flex; gap:14px; flex-wrap:wrap;">' +
+              extras.map(function (x) { return "<div>" + x + "</div>"; }).join("") +
+            "</div>"
+          : "";
 
         return (
           '<div style="border: 1px solid rgba(255,255,255,0.10); border-radius: 12px; padding: 10px; background: rgba(255,255,255,0.03);">' +
             '<div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap;">' +
               '<div>' +
                 '<div style="font-weight:700;">' + startTxt + " -> " + endTxt + "</div>" +
-                '<div class="muted" style="margin-top:4px;">' + relTxt + " • duration " + durTxt + "</div>" +
+                '<div class="muted" style="margin-top:4px;">' + relTxt + " \\u2022 duration " + durTxt + "</div>" +
               "</div>" +
               predPill +
-            "</div>' +
+            "</div>" +
             extrasHtml +
           "</div>"
         );
@@ -303,7 +303,6 @@
         var gw     = el("gw").value;
         var cw     = el("cw").value;
 
-        // durations must be "30min" strings for backend
         var params = new URLSearchParams({
           hours: String(hours),
           score_quantile: String(q),
@@ -335,11 +334,11 @@
         var lmp = s.map(function (r) { return (r.lmp_usd_per_mwh === null ? NaN : r.lmp_usd_per_mwh); });
         var isPred = s.map(function (r) { return !!r.is_predicted; });
 
-        // Windows overlay: use the SAME "windows" shown on the right
         var winFill = buildGreenFillShapes(data.windows || []);
         var winPredOutline = buildPredictedWindowOutlines(data.windows || [], data.meta);
 
         var predShade = predictedRegionShade(data.meta);
+
         var chart1Shapes = [];
         if (predShade) chart1Shapes.push(predShade);
         chart1Shapes = chart1Shapes.concat(winFill).concat(winPredOutline);
