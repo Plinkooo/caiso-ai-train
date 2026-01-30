@@ -13,7 +13,7 @@
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: start; }
     @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
     .card { padding: 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.03); }
-    .chart { height: 320px; }
+    .chart { width: 100%; height: 320px; min-height: 320px; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
     label { font-size: 12px; color: #a8b3d6; display: block; margin-bottom: 4px; }
     input { padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.04); color: #e8eefc; width: 140px; }
@@ -70,7 +70,7 @@
             </div>
           </div>
 
-          <div id="meta" class="muted metaLine"></div>
+          <div id="meta" class="muted metaLine">Loading…</div>
         </div>
 
         <div class="card">
@@ -93,14 +93,18 @@
 
     function el(id) {
       var node = document.getElementById(id);
-      if (!node) throw new Error("Missing element #" + id + " in HTML");
+      if (!node) { throw new Error("Missing element #" + id); }
       return node;
     }
 
+    function setMeta(msg) {
+      el("meta").textContent = msg;
+    }
+
     function allMissing(arr) {
-      return !arr || arr.length === 0 || arr.every(function (v) {
+      return (!arr || arr.length === 0 || arr.every(function (v) {
         return v === null || v === undefined || Number.isNaN(v);
-      });
+      }));
     }
 
     function buildShapes(windows) {
@@ -143,13 +147,12 @@
       if (k === -1) return { xF: x.slice(), yF: y.slice(), xP: [], yP: [] };
       if (k === 0)  return { xF: [], yF: [], xP: x.slice(), yP: y.slice() };
 
-      var xF = x.slice(0, k);
-      var yF = y.slice(0, k);
-
-      var xP = [x[k - 1]].concat(x.slice(k));
-      var yP = [y[k - 1]].concat(y.slice(k));
-
-      return { xF: xF, yF: yF, xP: xP, yP: yP };
+      return {
+        xF: x.slice(0, k),
+        yF: y.slice(0, k),
+        xP: [x[k - 1]].concat(x.slice(k)),
+        yP: [y[k - 1]].concat(y.slice(k))
+      };
     }
 
     function renderMeta(meta) {
@@ -160,17 +163,14 @@
         parts.push("Forecast cutoff: " + meta.forecast_cutoff_hours + "h (" + meta.forecast_cutoff_time + ")");
       }
       parts.push("LMP: " + ((meta && meta.lmp_available) ? "available (ends at cutoff)" : "unavailable"));
-      el("meta").textContent = parts.join(" | ");
+      setMeta(parts.join(" | "));
     }
 
     function fmtDateTime(isoStr) {
       var d = new Date(isoStr);
       return d.toLocaleString(undefined, {
-        weekday: "short",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit"
+        weekday: "short", month: "short", day: "numeric",
+        hour: "numeric", minute: "2-digit"
       });
     }
 
@@ -207,7 +207,7 @@
 
     function windowsToHTML(wins, label, meta) {
       if (!wins || wins.length === 0) {
-        return '<div class="muted">No ' + label + ' windows found. Try lowering the quantile or choosing a shorter minimum window.</div>';
+        return '<div class="muted">No ' + label + ' windows found.</div>';
       }
 
       var sorted = wins.slice().sort(function (a, b) {
@@ -230,15 +230,7 @@
         }
 
         var predPill = pred ? (
-          '<div class="muted" style="' +
-            'border: 1px solid rgba(255,80,80,0.35);' +
-            'background: rgba(255,80,80,0.10);' +
-            'color: #ffd6d6;' +
-            'padding: 4px 8px;' +
-            'border-radius: 999px;' +
-            'font-size: 12px;' +
-            'white-space: nowrap;' +
-          '">Predicted</div>'
+          '<div class="muted" style="border: 1px solid rgba(255,80,80,0.35); background: rgba(255,80,80,0.10); color: #ffd6d6; padding: 4px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;">Predicted</div>'
         ) : "";
 
         var extrasHtml = extras.length ? (
@@ -248,14 +240,14 @@
         ) : "";
 
         return (
-          '<div style="border: 1px solid rgba(255,255,255,0.10); border-radius: 12px; padding: 10px 10px; background: rgba(255,255,255,0.03);">' +
+          '<div style="border: 1px solid rgba(255,255,255,0.10); border-radius: 12px; padding: 10px; background: rgba(255,255,255,0.03);">' +
             '<div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap;">' +
               '<div>' +
                 '<div style="font-weight:700;">' + startTxt + " -> " + endTxt + "</div>" +
-                '<div class="muted" style="margin-top:4px;">' + relTxt + " \u2022 duration " + durTxt + "</div>" +
+                '<div class="muted" style="margin-top:4px;">' + relTxt + " • duration " + durTxt + "</div>" +
               "</div>" +
               predPill +
-            "</div>" +
+            "</div>' +
             extrasHtml +
           "</div>"
         );
@@ -265,7 +257,7 @@
     }
 
     async function loadData() {
-      if (!window.Plotly) throw new Error("Plotly did not load. Check the CDN script tag.");
+      if (!window.Plotly) throw new Error("Plotly did not load. CDN blocked or failed.");
 
       var hours  = el("hours").value;
       var q      = el("q").value;
@@ -274,7 +266,9 @@
       var gw     = el("gw").value;
       var cw     = el("cw").value;
 
-      // FIX: backend expects duration strings like "30min"
+      setMeta("Loading /api/next24…");
+
+      // IMPORTANT FIX: send durations as "30min" strings (backend expects this)
       var params = new URLSearchParams({
         hours: String(hours),
         score_quantile: String(q),
@@ -284,28 +278,36 @@
       });
       if (maxDur) params.set("max_duration", String(maxDur) + "min");
 
-      var res = await fetch("/api/next24?" + params.toString());
+      var url = "/api/next24?" + params.toString();
+
+      var res = await fetch(url);
+      var body = await res.text();
+
       if (!res.ok) {
-        var txt = await res.text();
-        el("meta").textContent = "API error: " + txt;
-        throw new Error(txt);
+        setMeta("API error (" + res.status + "):\n" + body);
+        return;
       }
 
-      var data = await res.json();
+      var data = JSON.parse(body);
       renderMeta(data.meta);
 
       var s = data.series || [];
+      if (s.length === 0) {
+        setMeta("API returned 0 points. Check build_series() time grid.");
+        return;
+      }
+
       var x = s.map(function (r) { return r.t_start; });
 
-      var load  = s.map(function (r) { return (r.load_forecast_mw ?? NaN); });
-      var ren   = s.map(function (r) { return (r.renewables_forecast_mw ?? NaN); });
-      var net   = s.map(function (r) { return (r.net_load_forecast_mw ?? NaN); });
+      var load = s.map(function (r) { return (r.load_forecast_mw === null ? NaN : r.load_forecast_mw); });
+      var ren  = s.map(function (r) { return (r.renewables_forecast_mw === null ? NaN : r.renewables_forecast_mw); });
+      var net  = s.map(function (r) { return (r.net_load_forecast_mw === null ? NaN : r.net_load_forecast_mw); });
 
-      var green = s.map(function (r) { return (r.green_score ?? NaN); });
-      var cheap = s.map(function (r) { return (r.cheap_score ?? NaN); });
-      var combo = s.map(function (r) { return (r.combined_score ?? NaN); });
+      var green = s.map(function (r) { return (r.green_score === null ? NaN : r.green_score); });
+      var cheap = s.map(function (r) { return (r.cheap_score === null ? NaN : r.cheap_score); });
+      var combo = s.map(function (r) { return (r.combined_score === null ? NaN : r.combined_score); });
 
-      var lmp   = s.map(function (r) { return (r.lmp_usd_per_mwh ?? NaN); });
+      var lmp = s.map(function (r) { return (r.lmp_usd_per_mwh === null ? NaN : r.lmp_usd_per_mwh); });
       var isPred = s.map(function (r) { return !!r.is_predicted; });
 
       var winShapes = buildShapes(data.windows || []);
@@ -324,7 +326,7 @@
         { x: netSeg.xF,  y: netSeg.yF,  name: "Net load", mode: "lines" },
         { x: netSeg.xP,  y: netSeg.yP,  name: "Net load (predicted)", mode: "lines", line: { color: "rgba(255, 110, 110, 0.95)" } }
       ], {
-        title: "Forecast (Load / Renewables / Net Load) - predicted region shaded",
+        title: "Forecast (Load / Renewables / Net Load)",
         paper_bgcolor: "rgba(0,0,0,0)",
         plot_bgcolor: "rgba(0,0,0,0)",
         font: { color: "#e8eefc" },
@@ -375,7 +377,7 @@
       Plotly.newPlot("chart3", [
         { x: x, y: lmp, name: "LMP ($/MWh)", mode: "lines" }
       ], {
-        title: "Price (LMP) - cuts off when market data ends",
+        title: "Price (LMP)",
         paper_bgcolor: "rgba(0,0,0,0)",
         plot_bgcolor: "rgba(0,0,0,0)",
         font: { color: "#e8eefc" },
@@ -393,7 +395,7 @@
 
     function showErr(err) {
       console.error(err);
-      try { el("meta").textContent = "Error: " + String(err && err.message ? err.message : err); } catch (e) {}
+      setMeta("JS error:\n" + String(err && err.message ? err.message : err));
     }
 
     el("refreshBtn").addEventListener("click", function () { loadData().catch(showErr); });
