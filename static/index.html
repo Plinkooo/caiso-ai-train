@@ -10,13 +10,19 @@
   <style>
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background: #0b1020; color: #e8eefc; }
     .wrap { max-width: 1300px; margin: 0 auto; padding: 18px; }
+    .header { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom: 12px; }
+    .title { font-size: 22px; font-weight: 750; letter-spacing: 0.2px; }
+    .subtitle { color:#a8b3d6; font-size: 13px; margin-top: 4px; }
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: start; }
     @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
     .card { padding: 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.03); }
     .chart { width: 100%; height: 320px; min-height: 320px; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
     label { font-size: 12px; color: #a8b3d6; display: block; margin-bottom: 4px; }
-    input { padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.04); color: #e8eefc; width: 140px; }
+    input, select {
+      padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.04); color: #e8eefc; width: 140px;
+    }
     button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: #e8eefc; cursor: pointer; }
     .muted { color: #a8b3d6; white-space: pre-wrap; }
     h2 { margin: 14px 0 6px; font-size: 16px; }
@@ -27,6 +33,14 @@
 
 <body>
   <div class="wrap">
+
+    <div class="header">
+      <div>
+        <div class="title">CAISO - Next 24–72 Hours</div>
+        <div class="subtitle">Green + Cheap training windows (forecast to cutoff, ridge beyond)</div>
+      </div>
+    </div>
+
     <div class="grid">
 
       <!-- LEFT: Charts -->
@@ -43,7 +57,11 @@
           <div class="row">
             <div>
               <label for="hours">Hours</label>
-              <input id="hours" type="number" value="24" min="1" max="72" />
+              <select id="hours">
+                <option value="24" selected>24</option>
+                <option value="48">48</option>
+                <option value="72">72</option>
+              </select>
             </div>
             <div>
               <label for="q">Score quantile</label>
@@ -70,7 +88,7 @@
             </div>
           </div>
 
-          <div id="meta" class="muted metaLine">Loading…</div>
+          <div id="meta" class="muted metaLine"></div>
         </div>
 
         <div class="card">
@@ -97,17 +115,14 @@
       return node;
     }
 
-    function setMeta(msg) {
-      el("meta").textContent = msg;
-    }
-
     function allMissing(arr) {
       return (!arr || arr.length === 0 || arr.every(function (v) {
         return v === null || v === undefined || Number.isNaN(v);
       }));
     }
 
-    function buildShapes(windows) {
+    // Base green fill for all windows
+    function buildGreenFillShapes(windows) {
       if (!Array.isArray(windows)) return [];
       return windows.map(function (w) {
         return {
@@ -124,7 +139,30 @@
       });
     }
 
-    function predictedShadeShape(meta) {
+    // Overlay outline for "predicted" windows
+    function buildPredictedWindowOutlines(windows, meta) {
+      if (!Array.isArray(windows) || !meta || !meta.forecast_cutoff_time) return [];
+      var cutoff = new Date(meta.forecast_cutoff_time).getTime();
+
+      return windows
+        .filter(function (w) { return new Date(w.start).getTime() > cutoff; })
+        .map(function (w) {
+          return {
+            type: "rect",
+            xref: "x",
+            yref: "paper",
+            x0: w.start,
+            x1: w.end,
+            y0: 0,
+            y1: 1,
+            fillcolor: "rgba(0,0,0,0)",
+            line: { width: 2, color: "rgba(255, 80, 80, 0.70)" }
+          };
+        });
+    }
+
+    // Predicted region shading (light red)
+    function predictedRegionShade(meta) {
       if (!meta || !meta.forecast_cutoff_time || !meta.horizon_end) return null;
       return {
         type: "rect",
@@ -163,7 +201,7 @@
         parts.push("Forecast cutoff: " + meta.forecast_cutoff_hours + "h (" + meta.forecast_cutoff_time + ")");
       }
       parts.push("LMP: " + ((meta && meta.lmp_available) ? "available (ends at cutoff)" : "unavailable"));
-      setMeta(parts.join(" | "));
+      el("meta").textContent = parts.join(" | ");
     }
 
     function fmtDateTime(isoStr) {
@@ -210,9 +248,7 @@
         return '<div class="muted">No ' + label + ' windows found.</div>';
       }
 
-      var sorted = wins.slice().sort(function (a, b) {
-        return new Date(a.start) - new Date(b.start);
-      });
+      var sorted = wins.slice().sort(function (a, b) { return new Date(a.start) - new Date(b.start); });
 
       var items = sorted.map(function (w) {
         var pred = isPredictedWindow(w, meta);
@@ -257,149 +293,148 @@
     }
 
     async function loadData() {
-      if (!window.Plotly) throw new Error("Plotly did not load. CDN blocked or failed.");
+      try {
+        if (!window.Plotly) throw new Error("Plotly did not load.");
 
-      var hours  = el("hours").value;
-      var q      = el("q").value;
-      var minDur = el("minDur").value;
-      var maxDur = el("maxDur").value;
-      var gw     = el("gw").value;
-      var cw     = el("cw").value;
+        var hours  = el("hours").value;
+        var q      = el("q").value;
+        var minDur = el("minDur").value;
+        var maxDur = el("maxDur").value;
+        var gw     = el("gw").value;
+        var cw     = el("cw").value;
 
-      setMeta("Loading /api/next24…");
-
-      // IMPORTANT FIX: send durations as "30min" strings (backend expects this)
-      var params = new URLSearchParams({
-        hours: String(hours),
-        score_quantile: String(q),
-        min_duration: String(minDur) + "min",
-        green_weight: String(gw),
-        cheap_weight: String(cw)
-      });
-      if (maxDur) params.set("max_duration", String(maxDur) + "min");
-
-      var url = "/api/next24?" + params.toString();
-
-      var res = await fetch(url);
-      var body = await res.text();
-
-      if (!res.ok) {
-        setMeta("API error (" + res.status + "):\n" + body);
-        return;
-      }
-
-      var data = JSON.parse(body);
-      renderMeta(data.meta);
-
-      var s = data.series || [];
-      if (s.length === 0) {
-        setMeta("API returned 0 points. Check build_series() time grid.");
-        return;
-      }
-
-      var x = s.map(function (r) { return r.t_start; });
-
-      var load = s.map(function (r) { return (r.load_forecast_mw === null ? NaN : r.load_forecast_mw); });
-      var ren  = s.map(function (r) { return (r.renewables_forecast_mw === null ? NaN : r.renewables_forecast_mw); });
-      var net  = s.map(function (r) { return (r.net_load_forecast_mw === null ? NaN : r.net_load_forecast_mw); });
-
-      var green = s.map(function (r) { return (r.green_score === null ? NaN : r.green_score); });
-      var cheap = s.map(function (r) { return (r.cheap_score === null ? NaN : r.cheap_score); });
-      var combo = s.map(function (r) { return (r.combined_score === null ? NaN : r.combined_score); });
-
-      var lmp = s.map(function (r) { return (r.lmp_usd_per_mwh === null ? NaN : r.lmp_usd_per_mwh); });
-      var isPred = s.map(function (r) { return !!r.is_predicted; });
-
-      var winShapes = buildShapes(data.windows || []);
-      var predShade = predictedShadeShape(data.meta);
-      var shapes = predShade ? [predShade].concat(winShapes) : winShapes;
-
-      var loadSeg = splitWithBoundary(x, load, isPred);
-      var renSeg  = splitWithBoundary(x, ren,  isPred);
-      var netSeg  = splitWithBoundary(x, net,  isPred);
-
-      Plotly.newPlot("chart1", [
-        { x: loadSeg.xF, y: loadSeg.yF, name: "Load", mode: "lines" },
-        { x: loadSeg.xP, y: loadSeg.yP, name: "Load (predicted)", mode: "lines", line: { color: "rgba(255, 140, 140, 0.95)" } },
-        { x: renSeg.xF,  y: renSeg.yF,  name: "Renewables", mode: "lines" },
-        { x: renSeg.xP,  y: renSeg.yP,  name: "Renewables (predicted)", mode: "lines", line: { color: "rgba(255, 170, 170, 0.95)" } },
-        { x: netSeg.xF,  y: netSeg.yF,  name: "Net load", mode: "lines" },
-        { x: netSeg.xP,  y: netSeg.yP,  name: "Net load (predicted)", mode: "lines", line: { color: "rgba(255, 110, 110, 0.95)" } }
-      ], {
-        title: "Forecast (Load / Renewables / Net Load)",
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor: "rgba(0,0,0,0)",
-        font: { color: "#e8eefc" },
-        xaxis: { showgrid: false, zeroline: false },
-        yaxis: { title: "MW", gridcolor: "rgba(34,48,85,0.55)" },
-        margin: { l: 55, r: 18, t: 42, b: 45 },
-        shapes: shapes
-      }, { displayModeBar: false, responsive: true });
-
-      var scoreAnnotations = [];
-      if (allMissing(cheap)) {
-        scoreAnnotations.push({
-          xref: "paper", yref: "paper",
-          x: 0.01, y: 0.98, xanchor: "left", yanchor: "top",
-          text: "Cheap score unavailable (no LMP data).",
-          showarrow: false,
-          font: { size: 12, color: "#a8b3d6" }
+        // durations must be "30min" strings for backend
+        var params = new URLSearchParams({
+          hours: String(hours),
+          score_quantile: String(q),
+          min_duration: String(minDur) + "min",
+          green_weight: String(gw),
+          cheap_weight: String(cw)
         });
+        if (maxDur) params.set("max_duration", String(maxDur) + "min");
+
+        var res = await fetch("/api/next24?" + params.toString());
+        if (!res.ok) throw new Error(await res.text());
+
+        var data = await res.json();
+        renderMeta(data.meta);
+
+        var s = data.series || [];
+        if (s.length === 0) throw new Error("No series data returned.");
+
+        var x = s.map(function (r) { return r.t_start; });
+
+        var load = s.map(function (r) { return (r.load_forecast_mw === null ? NaN : r.load_forecast_mw); });
+        var ren  = s.map(function (r) { return (r.renewables_forecast_mw === null ? NaN : r.renewables_forecast_mw); });
+        var net  = s.map(function (r) { return (r.net_load_forecast_mw === null ? NaN : r.net_load_forecast_mw); });
+
+        var green = s.map(function (r) { return (r.green_score === null ? NaN : r.green_score); });
+        var cheap = s.map(function (r) { return (r.cheap_score === null ? NaN : r.cheap_score); });
+        var combo = s.map(function (r) { return (r.combined_score === null ? NaN : r.combined_score); });
+
+        var lmp = s.map(function (r) { return (r.lmp_usd_per_mwh === null ? NaN : r.lmp_usd_per_mwh); });
+        var isPred = s.map(function (r) { return !!r.is_predicted; });
+
+        // Windows overlay: use the SAME "windows" shown on the right
+        var winFill = buildGreenFillShapes(data.windows || []);
+        var winPredOutline = buildPredictedWindowOutlines(data.windows || [], data.meta);
+
+        var predShade = predictedRegionShade(data.meta);
+        var chart1Shapes = [];
+        if (predShade) chart1Shapes.push(predShade);
+        chart1Shapes = chart1Shapes.concat(winFill).concat(winPredOutline);
+
+        var chart2Shapes = winFill.concat(winPredOutline);
+        var chart3Shapes = winFill.concat(winPredOutline);
+
+        var loadSeg = splitWithBoundary(x, load, isPred);
+        var renSeg  = splitWithBoundary(x, ren,  isPred);
+        var netSeg  = splitWithBoundary(x, net,  isPred);
+
+        Plotly.newPlot("chart1", [
+          { x: loadSeg.xF, y: loadSeg.yF, name: "Load", mode: "lines" },
+          { x: loadSeg.xP, y: loadSeg.yP, name: "Load (predicted)", mode: "lines", line: { color: "rgba(255, 140, 140, 0.95)" } },
+
+          { x: renSeg.xF,  y: renSeg.yF,  name: "Renewables", mode: "lines" },
+          { x: renSeg.xP,  y: renSeg.yP,  name: "Renewables (predicted)", mode: "lines", line: { color: "rgba(255, 170, 170, 0.95)" } },
+
+          { x: netSeg.xF,  y: netSeg.yF,  name: "Net load", mode: "lines" },
+          { x: netSeg.xP,  y: netSeg.yP,  name: "Net load (predicted)", mode: "lines", line: { color: "rgba(255, 110, 110, 0.95)" } }
+        ], {
+          title: "Forecast (Load / Renewables / Net Load)",
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(0,0,0,0)",
+          font: { color: "#e8eefc" },
+          xaxis: { showgrid: false, zeroline: false },
+          yaxis: { title: "MW", gridcolor: "rgba(34,48,85,0.55)" },
+          margin: { l: 55, r: 18, t: 42, b: 45 },
+          shapes: chart1Shapes
+        }, { displayModeBar: false, responsive: true });
+
+        var scoreAnnotations = [];
+        if (allMissing(cheap)) {
+          scoreAnnotations.push({
+            xref: "paper", yref: "paper",
+            x: 0.01, y: 0.98, xanchor: "left", yanchor: "top",
+            text: "Cheap score unavailable (no LMP data).",
+            showarrow: false,
+            font: { size: 12, color: "#a8b3d6" }
+          });
+        }
+
+        Plotly.newPlot("chart2", [
+          { x: x, y: green, name: "Green score", mode: "lines" },
+          { x: x, y: cheap, name: "Cheap score", mode: "lines" },
+          { x: x, y: combo, name: "Combined score", mode: "lines" }
+        ], {
+          title: "Scores (higher is better)",
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(0,0,0,0)",
+          font: { color: "#e8eefc" },
+          xaxis: { showgrid: false, zeroline: false },
+          yaxis: { range: [0, 1], gridcolor: "rgba(34,48,85,0.55)" },
+          margin: { l: 55, r: 18, t: 42, b: 45 },
+          shapes: chart2Shapes,
+          annotations: scoreAnnotations
+        }, { displayModeBar: false, responsive: true });
+
+        var priceAnnotations = [];
+        if (allMissing(lmp)) {
+          priceAnnotations.push({
+            xref: "paper", yref: "paper",
+            x: 0.5, y: 0.5, xanchor: "center", yanchor: "middle",
+            text: "LMP price data unavailable right now.",
+            showarrow: false,
+            font: { size: 14, color: "#a8b3d6" }
+          });
+        }
+
+        Plotly.newPlot("chart3", [
+          { x: x, y: lmp, name: "LMP ($/MWh)", mode: "lines" }
+        ], {
+          title: "Price (LMP)",
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(0,0,0,0)",
+          font: { color: "#e8eefc" },
+          xaxis: { showgrid: false, zeroline: false },
+          yaxis: { title: "$/MWh", gridcolor: "rgba(34,48,85,0.55)" },
+          margin: { l: 55, r: 18, t: 42, b: 45 },
+          shapes: chart3Shapes,
+          annotations: priceAnnotations
+        }, { displayModeBar: false, responsive: true });
+
+        el("winGreen").innerHTML = windowsToHTML(data.windows_green, "green", data.meta);
+        el("winCheap").innerHTML = windowsToHTML(data.windows_cheap, "cheap", data.meta);
+        el("winBoth").innerHTML  = windowsToHTML(data.windows_both, "both", data.meta);
+
+      } catch (err) {
+        console.error(err);
+        el("meta").textContent = "Error loading data - check /api/next24 and Render logs.";
       }
-
-      Plotly.newPlot("chart2", [
-        { x: x, y: green, name: "Green score", mode: "lines" },
-        { x: x, y: cheap, name: "Cheap score", mode: "lines" },
-        { x: x, y: combo, name: "Combined score", mode: "lines" }
-      ], {
-        title: "Scores (higher is better)",
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor: "rgba(0,0,0,0)",
-        font: { color: "#e8eefc" },
-        xaxis: { showgrid: false, zeroline: false },
-        yaxis: { range: [0, 1], gridcolor: "rgba(34,48,85,0.55)" },
-        margin: { l: 55, r: 18, t: 42, b: 45 },
-        shapes: winShapes,
-        annotations: scoreAnnotations
-      }, { displayModeBar: false, responsive: true });
-
-      var priceAnnotations = [];
-      if (allMissing(lmp)) {
-        priceAnnotations.push({
-          xref: "paper", yref: "paper",
-          x: 0.5, y: 0.5, xanchor: "center", yanchor: "middle",
-          text: "LMP price data unavailable right now.",
-          showarrow: false,
-          font: { size: 14, color: "#a8b3d6" }
-        });
-      }
-
-      Plotly.newPlot("chart3", [
-        { x: x, y: lmp, name: "LMP ($/MWh)", mode: "lines" }
-      ], {
-        title: "Price (LMP)",
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor: "rgba(0,0,0,0)",
-        font: { color: "#e8eefc" },
-        xaxis: { showgrid: false, zeroline: false },
-        yaxis: { title: "$/MWh", gridcolor: "rgba(34,48,85,0.55)" },
-        margin: { l: 55, r: 18, t: 42, b: 45 },
-        shapes: winShapes,
-        annotations: priceAnnotations
-      }, { displayModeBar: false, responsive: true });
-
-      el("winGreen").innerHTML = windowsToHTML(data.windows_green, "green", data.meta);
-      el("winCheap").innerHTML = windowsToHTML(data.windows_cheap, "cheap", data.meta);
-      el("winBoth").innerHTML  = windowsToHTML(data.windows_both, "both", data.meta);
     }
 
-    function showErr(err) {
-      console.error(err);
-      setMeta("JS error:\n" + String(err && err.message ? err.message : err));
-    }
-
-    el("refreshBtn").addEventListener("click", function () { loadData().catch(showErr); });
-    loadData().catch(showErr);
+    el("refreshBtn").addEventListener("click", loadData);
+    loadData();
   });
   </script>
 </body>
