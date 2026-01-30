@@ -18,7 +18,7 @@
     label { font-size: 12px; color: #a8b3d6; display: block; margin-bottom: 4px; }
     input { padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.04); color: #e8eefc; width: 140px; }
     button { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.06); color: #e8eefc; cursor: pointer; }
-    .muted { color: #a8b3d6; }
+    .muted { color: #a8b3d6; white-space: pre-wrap; }
     h2 { margin: 14px 0 6px; font-size: 16px; }
     .rightStack { display: grid; gap: 14px; }
     .metaLine { margin-top: 10px; }
@@ -274,17 +274,22 @@
       var gw     = el("gw").value;
       var cw     = el("cw").value;
 
+      // FIX: backend expects duration strings like "30min"
       var params = new URLSearchParams({
-        hours: hours,
-        score_quantile: q,
-        min_duration: minDur,
-        green_weight: gw,
-        cheap_weight: cw
+        hours: String(hours),
+        score_quantile: String(q),
+        min_duration: String(minDur) + "min",
+        green_weight: String(gw),
+        cheap_weight: String(cw)
       });
-      if (maxDur) params.set("max_duration", maxDur);
+      if (maxDur) params.set("max_duration", String(maxDur) + "min");
 
       var res = await fetch("/api/next24?" + params.toString());
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        var txt = await res.text();
+        el("meta").textContent = "API error: " + txt;
+        throw new Error(txt);
+      }
 
       var data = await res.json();
       renderMeta(data.meta);
@@ -388,7 +393,7 @@
 
     function showErr(err) {
       console.error(err);
-      try { el("meta").textContent = "Error loading data - check /api/next24 and Render logs."; } catch (e) {}
+      try { el("meta").textContent = "Error: " + String(err && err.message ? err.message : err); } catch (e) {}
     }
 
     el("refreshBtn").addEventListener("click", function () { loadData().catch(showErr); });
