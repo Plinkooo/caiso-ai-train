@@ -787,7 +787,7 @@ def health() -> Dict[str, Any]:
 @app.get("/api/next24")
 def api_next24(
     hours: int = Query(24, ge=1, le=72),
-    score_quantile: float = Query(0.80, ge=0.50, le=0.95),
+    score_quantile: float = Query(0.80, ge=0.00, le=0.95),
     min_duration: str = Query("60min"),
     max_duration: str = Query("", description="Optional, e.g. 180min"),
     green_weight: float = Query(0.5, ge=0.0, le=1.0),
