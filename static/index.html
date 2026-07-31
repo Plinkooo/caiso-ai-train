@@ -24,6 +24,7 @@
       background:rgba(255,255,255,0.04); color:#e8eefc; width:140px;
     }
     button { padding:9px 12px; border-radius:10px; border:1px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06); color:#e8eefc; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
     .muted { color:#a8b3d6; }
     h2 { margin:14px 0 6px; font-size:16px; }
     .rightStack { display:grid; gap:14px; }
@@ -37,6 +38,10 @@
         <div class="title">CAISO Energy Usage Tracker</div>
         <div class="subtitle">Green and Cheap training windows</div>
       </div>
+    </div>
+
+    <div id="loadingBar" class="muted" style="margin-bottom:10px; display:none;">
+      Loading grid data…
     </div>
 
     <div class="grid">
@@ -305,6 +310,11 @@ document.addEventListener("DOMContentLoaded", function () {
   async function loadData() {
     if (!window.Plotly) throw new Error("Plotly did not load.");
 
+    el("loadingBar").textContent = "Loading grid data…";
+    el("loadingBar").style.display = "block";
+    el("refreshBtn").disabled = true;
+
+    try {
     var hours  = el("hours").value;
     var q      = el("q").value;
     var minDur = el("minDur").value;
@@ -444,13 +454,23 @@ document.addEventListener("DOMContentLoaded", function () {
     el("winGreen").innerHTML = windowsToHTML(data.windows_green, "green", meta);
     el("winCheap").innerHTML = windowsToHTML(data.windows_cheap, "cheap", meta);
     el("winBoth").innerHTML  = windowsToHTML(data.windows_both, "both", meta);
+    } finally {
+      el("loadingBar").style.display = "none";
+      el("refreshBtn").disabled = false;
+    }
+  }
+
+  function showLoadError(err) {
+    console.error(err);
+    el("loadingBar").textContent = "Error loading data: " + err.message;
+    el("loadingBar").style.display = "block";
   }
 
   el("refreshBtn").addEventListener("click", function () {
-    loadData().catch(function (err) { console.error(err); });
+    loadData().catch(showLoadError);
   });
 
-  loadData().catch(function (err) { console.error(err); });
+  loadData().catch(showLoadError);
 });
 </script>
 </body>
